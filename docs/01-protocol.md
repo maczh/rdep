@@ -55,9 +55,15 @@ enum CmdType {          // 实际线值
     Rename,            // 改名
     Mkdir,             // 一次性创建多级子目录
     Ping,              // 心跳
-    PublishCommit,     // 发布收尾：执行重启脚本
+    PublishCommit = 16,// 发布收尾：执行重启脚本
+    Backups = 17,      // 列出备份版本（备份库不在部署根，无法用 Ls 遍历）
 }
 ```
+
+> `Backups`（命令号 17）是为 **root/meta 目录分离** 补的指令：备份版本库已从部署根
+> （`<RDEP_ROOT>/backup/`）迁到 service 私有工作目录（`<RDEP_META>/backup/`），
+> 客户端无法再用 `Ls /backup` 枚举版本，因此单列一条指令。
+> 请求 `BackupsRequest{}`，响应 `BackupsResponse{ versions: Vec<String> }`（版本号升序）。
 
 ### 请求/响应通用结构（postcard 编码）
 
@@ -106,8 +112,11 @@ client                                   service
   |<--------- CmdResponse(ok / RestartFailed) -|
 ```
 
-- **备份**：写新内容前，若目标已存在，先复制到 `backup/<YYMMDDHHmm>/<相对路径>`；
+- **备份**：写新内容前，若目标已存在，先复制到 `<RDEP_META>/backup/<YYMMDDHHmm>/<相对路径>`；
   超出 `RDEP_BACKUP_KEEP`（默认 10）自动剪枝最旧版本。
+  ⚠️ 备份库在 **service 私有工作目录（meta）**，**不在部署根**——部署根可能只读
+  （如 `RDEP_ROOT=/` 且 service 非 root），且客户端 `ls /` 不应看到 `backup`。
+  因此枚举版本走 `CmdType::Backups`，不能用 `Ls /backup`。
 - **重启脚本**仅在 `PublishCommit` 执行（不是每个 Upload commit 都执行）。
 
 **项目模式（`project` 字段）**
@@ -119,8 +128,8 @@ client                                   service
 - `items` 只是**声明性清单**（客户端据此规划分片上传），真正决定落盘位置的是
   `UploadInit.remote_path`；约束必须在 Upload 阶段施加，改写 `items` 是无效的。
 - 项目不存在 → `CmdResponse{ok:false, message:"project not found"}`。
-- **回滚**：`Rollback{remote_dir, version}` 把 `backup/<version>/<remote_dir>` 恢复覆盖；
-  version 仅允许数字（防路径注入）。
+- **回滚**：`Rollback{remote_dir, version}` 把 `<meta>/backup/<version>/<remote_dir>` 恢复覆盖；
+  version 仅允许数字（防路径注入）；备份源强制位于 meta 之内，越权直接拒绝。
 
 ### Edit 读 / 存
 
@@ -149,8 +158,12 @@ UploadInit {
 ```rust
 DataChunk { transfer_id: u64, index: u32, data: Vec<u8>, chunk_sha256: [u8;32] }
 ```
-服务端校验分片 `chunk_sha256` 后，把分片落盘暂存到 `root/.rdep-staging/<transfer_id>/<index>.chunk`
-（先写 `.tmp` 再原子改名）。**「已收片集合」= 现存的分片文件**，天然跨连接/跨会话持久化。
+服务端校验分片 `chunk_sha256` 后，把分片落盘暂存到
+`<RDEP_META>/.rdep-staging/<transfer_id>/<index>.chunk`（先写 `.tmp` 再原子改名）。
+**「已收片集合」= 现存的分片文件**，天然跨连接/跨会话持久化。
+⚠️ 暂存区必须在 **meta**（service 私有、保证可写）而非部署根：早期实现建在
+`<RDEP_ROOT>/.rdep-staging/`，于是 `RDEP_ROOT=/` 且 service 非 root 时上传直接
+`stage chunk …: Permission denied (os error 13)`。
 
 ### 4.3 提交与校验（控制通道，`CmdType::Upload` + `UploadCommit{transfer_id}`）
 服务端：从暂存区按 `0..total_chunks` 顺序合并 → 校验整文件 `file_sha256`（不符回

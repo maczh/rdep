@@ -27,27 +27,26 @@ impl Tee {
     /// 写入前惰性打开/重开文件：滚动后无需持有陈旧句柄。
     fn write_both(&mut self, buf: &[u8]) -> std::io::Result<()> {
         use std::io::ErrorKind;
-        let mut f = match &self.file {
-            Some(m) => m.lock().unwrap(),
-            None => {
-                let mut opts = OpenOptions::new();
-                opts.create(true).append(true);
-                match opts.open(&self.path) {
-                    Ok(f) => self.file.get_or_insert(Mutex::new(f)).lock().unwrap(),
-                    Err(e) if e.kind() == ErrorKind::NotFound => {
-                        // 目录不存在：先建目录再试一次
-                        if let Some(p) = self.path.parent() {
-                            let _ = std::fs::create_dir_all(p);
-                        }
-                        match opts.open(&self.path) {
-                            Ok(f) => self.file.get_or_insert(Mutex::new(f)).lock().unwrap(),
-                            Err(_) => return Err(std::io::Error::new(ErrorKind::Other, "log file unavailable")),
-                        }
+        // 惰性打开文件：首次写入时才创建（并自动建目录）
+        if self.file.is_none() {
+            let mut opts = OpenOptions::new();
+            opts.create(true).append(true);
+            let opened = match opts.open(&self.path) {
+                Ok(f) => Ok(f),
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    // 目录不存在：先建目录再试一次
+                    if let Some(p) = self.path.parent() {
+                        let _ = std::fs::create_dir_all(p);
                     }
-                    Err(e) => return Err(e),
+                    opts.open(&self.path)
+                        .map_err(|_| std::io::Error::other("log file unavailable"))
                 }
-            }
-        };
+                Err(e) => Err(e),
+            }?;
+            self.file = Some(Mutex::new(opened));
+        }
+        // 已持有 &mut，直接用 get_mut 取内部 File，无需加锁（也就不可能死锁/中毒）
+        let f = self.file.as_mut().unwrap().get_mut().unwrap();
         f.write_all(buf)?;
         f.flush()
     }

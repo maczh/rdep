@@ -276,6 +276,11 @@ pub enum CmdType {
     Mkdir,
     Ping,
     PublishCommit,
+    /// 列出服务端已保存的备份版本（回滚用）。
+    ///
+    /// 备份库位于 service 的私有工作目录（meta），**不在部署根之下**，
+    /// 因此无法用 `Ls /backup` 取得（早期实现靠 ls 猜路径，备份位置一变就失效）。
+    Backups,
 }
 
 impl CmdType {
@@ -297,9 +302,20 @@ impl CmdType {
             14 => CmdType::Mkdir,
             15 => CmdType::Ping,
             16 => CmdType::PublishCommit,
+            17 => CmdType::Backups,
             _ => return Err(Error::UnknownCommand(v)),
         })
     }
+}
+
+/// 列备份版本：无参数（service 直接返回自己工作目录下的版本列表）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BackupsRequest {}
+
+/// 备份版本列表（版本号即备份目录名，字典序/时间序升序）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupsResponse {
+    pub versions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

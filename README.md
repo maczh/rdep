@@ -30,11 +30,18 @@
 - **多协议**：`rdep`（自有协议，功能最全）/ `FTP`（基础文件操作，明文）/ `SFTP`（SSH，支持浏览/上传/下载/新建/删除/改名/目录同步/断点续传/tail/grep/编辑）。
 - **多语言**：界面支持英文 / 简体中文 / 繁體中文，默认英文；顶栏可随时切换，选择持久化到 `rdep/ui.json`。新增文案用**英文作 key**，缺翻译回退英文，构建永不因漏翻而中断。
 - **文件操作**：浏览/上传/下载/删除/复制/移动/改名/建目录，**权限位保留**（`+x` 不丢失）。
-- **发布 / 回滚**：覆盖前自动备份（`backup/<版本>/`，默认留 10 个），收尾执行重启脚本，出错一键回滚。
+- **发布 / 回滚**：覆盖前自动备份（默认留 10 个版本），收尾执行重启脚本，出错一键回滚。
+  工具条上是**两个独立按钮**：`Publish`（发布）与 `Rollback`（回滚）。
+  回滚窗口打开时自动拉取备份版本列表（新增协议指令 `Backups`，命令号 17）。
+  ⚠️ 备份存放在 service 的 **meta 私有目录**（`RDEP_META`，默认 `data/meta/<root>`），
+  **不在部署根下**，因此部署目录只读也能发布/回滚，且 `ls /` 看不到 `backup`。
 - **项目即单一来源**：在 Web 后台登记项目（部署目录 + 重启脚本）后，客户端按**项目名**发布；服务端以项目记录为准，并**强制把上传文件落到项目目录之下**，客户端无法越出该目录。
 - **目录同步**：本地目录 → 远端，rsync 风格大小+mtime 快筛，支持 dry-run 预览、删除远端多余文件、单文件失败不中断整批。
 - **弱网韧性**：**断点续传**上传（服务端分片落盘，重试只补缺失片）、**自动重连**（探活后透明重连）、下载**流式落盘**+SHA-256 校验+原子改名。
 - **运维**：tail 实时日志（可跟随/停止）、grep 内容检索、远端文件在线编辑。
+  这三个操作在**远程文件列表右键菜单**里，直接对选中文件生效：菜单项 → 弹出
+  **参数窗口**（目标路径、行数/模式等，已按选中文件预填）→ 点 `Execute` 执行 →
+  结果在**可编辑文本框**窗口展示（tail 持续追加、grep 列出命中行、edit 可改后 `Save`）。
 - **公网中转**：service 主动注册到 forwarder，client 经其路由；同一 service 可并发服务多个 client。
   管理后台记录**每个 service 的中继审计**（客户端会话数、最后服务时间），可回答「谁在用这个 service」。
 
@@ -47,6 +54,9 @@ cargo test -p rdep-protocol                   # 协议单测
 cargo test -p rdep-client --no-default-features --test integration -- --test-threads=2
 cargo test -p rdep-client --lib                              # 站点/FTP/GUI 冒烟（需 gui 特性）
 cargo test -p rdep-client --no-default-features --test ftp_e2e -- --test-threads=1
+
+# 一体化冒烟：进程内起 service 并连上，跑 AUTH/MKDIR/LS/UPLOAD/DOWNLOAD/RENAME/COPY/MOVE/DELETE
+cargo run -p rdep-service --bin rdep-selftest    # 全绿时打印 ALL SELFTEST PASSED
 
 # 发布产物（输出到 dist/）
 ./deploy/build-release.sh --server            # service + forwarder
@@ -112,14 +122,29 @@ cargo run --release -p rdep-service
 
 ## 发布 / 回滚（核心工作流）
 
-1. 在客户端「发布/回滚」窗口把本地文件加入**发布清单**并选择**重启脚本 ID**。
-2. 点「执行发布」：服务端先备份被覆盖的旧文件到 `backup/<YYMMDDHHmm>/`，写入新文件，
-   全部完成后执行 `sh <restart_script_id> <remote_dir>`。
-3. 出问题：在同一窗口「列出备份版本」→ 选版本 → 「执行回滚」即恢复。
-   也可在 Web 后台点回滚。
+工具条上是**两个独立按钮**：`Publish` 与 `Rollback`（另有 `Sync` 目录同步）。
+
+1. 点工具条 `Publish` 打开发布窗口：把本地文件加入**发布清单**并选择**重启脚本 ID**。
+2. 点「执行发布」：服务端先备份被覆盖的旧文件到 `<meta>/backup/<YYMMDDHHmm>/`，
+   写入新文件，全部完成后执行 `sh <restart_script_id> <remote_dir>`。
+3. 点工具条 `Rollback` 打开回滚窗口：**打开时自动列出备份版本**（协议指令 `Backups`），
+   选一个版本 → 「执行回滚」即恢复。也可在 Web 后台点回滚。
 
 - 备份版本默认保留最近 `RDEP_BACKUP_KEEP=10` 个，超出自动剪枝。
+- 备份存在 service 私有 meta 目录，**不占部署目录、不受部署目录只读影响**。
 - 重启脚本放在 `RDEP_SCRIPTS` 目录，文件名即 ID（支持 `<id>` 或 `<id>.sh`）。
+
+## 远程文件右键菜单（Tail / Grep / Edit）
+
+在**远程文件列表**上右键，菜单除常规文件操作外还有：
+
+| 菜单项 | 适用对象 | 参数窗口预填 | 结果 |
+|---|---|---|---|
+| `Tail` | 文件 | 目标文件路径、行数 | 结果窗口持续追加新行，可 `Stop follow` |
+| `Grep` | 文件 / 目录 | 目标路径、匹配模式 | 命中行列表填入结果编辑框 |
+| `Edit` | 文件 | 目标文件路径 | 载入内容到编辑框，改完 `Save`（服务端自动备份） |
+
+流程统一为：**右键菜单 → 参数窗口（已按选中文件预填）→ `Execute` → 结果编辑窗口**。
 
 ## 连接排障（FAQ）
 
@@ -136,9 +161,17 @@ cargo run --release -p rdep-service
 - **远程面板的 `/` 不是真实文件系统根目录**：rdep 协议是**沙箱化**的文件存储协议，
   远程 `/` 即 service 的 `RDEP_ROOT`（默认 `data/root`），`..` 无法越出该根（防越权）。
   要像 SFTP 一样浏览真实文件系统，以 `RDEP_ROOT=/` 启动 service 即可（已实测
-  `ls /` 返回真实根目录；注意 `.rdep-staging`/`backup` 工作目录会建在 `/` 下）。
+  `ls /` 返回真实根目录）。**分片暂存与备份都在 meta 目录**（见下方 `RDEP_META`），
+  不会在 `/` 下创建 `.rdep-staging`/`backup`，`ls /` 看到的就是纯净的真实根目录。
   服务端**不跟随符号链接**（防链接逃逸），因此 `bin -> usr/bin` 这类链接目录
   显示为文件，浏览 `usr` 即可看到相同内容。
+- **上传报 `stage chunk N of transfer <id>: Permission denied (os error 13)`**：
+  ✅ 已修复。原因是**分片暂存区建在部署根下**（`<RDEP_ROOT>/.rdep-staging/`），
+  当部署根不可写时（典型：`RDEP_ROOT=/` 而 service 以非 root 运行）必然 EACCES。
+  现在暂存区与备份库都落在 service 私有目录 **`RDEP_META`**（默认
+  `data/meta/<部署根路径转义>`，按根隔离，多实例不互相踩）；部署根只读也能正常上传/发布/回滚。
+  升级后仍报同类错误，先看启动日志里 `meta=` 指向的目录是否可写
+  （`RUST_LOG=info ./rdep-service | head`）。
 - **Refresh 按钮点了没反应**：此前是残留的「目录树 ls」在途标记把主面板应答吞进了树缓存，
   以及未连接时静默 no-op。现在：出错/断连会清理该标记；未连接点 Refresh 会明确提示
   `Not connected; connect first`；刷新前先清标记，保证应答落在主面板。
@@ -181,9 +214,10 @@ RUST_LOG=debug  ./target/debug/rdep-client        # 客户端：stderr + 日志�
 
 ## 断点续传 / 自动重连（弱网韧性）
 
-- **断点续传**：上传分片先在服务端落盘暂存（`root/.rdep-staging/`），客户端用稳定的
-  `transfer_id = hash(路径+内容)`；重试/断线重连时，init 会回传服务端已收分片，客户端
-  **只补传缺失片**。大文件发布到弱网可断点恢复，而非从头再来。
+- **断点续传**：上传分片先在服务端落盘暂存（`<RDEP_META>/.rdep-staging/`，**不落在部署根**），
+  客户端用稳定的 `transfer_id = hash(路径+内容)`；重试/断线重连时，init 会回传服务端已收分片，
+  客户端**只补传缺失片**。大文件发布到弱网可断点恢复，而非从头再来。
+  部署目录只读（如 `RDEP_ROOT=/` 且 service 非 root）也照常可用。
 - **自动重连**：客户端在每个操作前用 `PING/PONG` 探活；连接掉线时自动用上次参数重连并
   重新认证，随后重试的操作即可命中续传（无需手动重连）。
 - **并发中转**：service 维持 `RDEP_MAX_SESSIONS`（默认 4）条常驻隧道，同一 service 可并发
@@ -203,7 +237,8 @@ RUST_LOG=debug  ./target/debug/rdep-client        # 客户端：stderr + 日志�
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `RDEP_LISTEN` | `0.0.0.0:8443` | rdep 协议监听 |
-| `RDEP_ROOT` | `data/root` | 远程文件根目录 |
+| `RDEP_ROOT` | `data/root` | 远程文件根目录（**部署目录**，可只读） |
+| `RDEP_META` | `data/meta/<root 路径转义>` | **service 私有工作目录**：分片暂存 `.rdep-staging/`、备份 `backup/`。按部署根隔离，多实例不冲突；部署根只读时必须给一个可写路径 |
 | `RDEP_DB` | `data/rdep.db` | SQLite |
 | `RDEP_SCRIPTS` | `data/scripts` | 重启脚本目录 |
 | `RDEP_CERT` / `RDEP_KEY` | `certs/server.crt` / `.key` | TLS |
@@ -268,10 +303,10 @@ FTP 仍为**明文传输**，且不具备上述高级能力；GUI 在选择 FTP 
 | 套件 | 数量 | 覆盖 |
 |---|---|---|
 | 协议单测 | 5 | 帧编解码、分片、校验、续传位图 |
-| service 单测 | 17 | 暂存 GC、符号链接安全、**口令散列/认证迁移**、**路径穿越/注入对抗测试**（12 种穿越写法、回滚源路径越权、版本号注入、合法路径不误伤）、Web 令牌随机性 |
-| forwarder 单测 | 9 | 口令散列（5）、Web 会话令牌 256bit 随机性、会话上限、**中继审计计数**、老库迁移补列 |
-| client 单测 | 26 | 站点持久化/混淆、**FTP** 列表解析/转义/时间/参数映射、**SFTP** 命令拼接/参数映射/known_hosts/引号转义、**i18n** 查表与回退/持久化/语言码、**字体**扫描 |
-| GUI 冒烟 | 7 | 无显示环境下用 `egui::Context::run()` 跑完整渲染路径：全窗口打开、边界数据（`..`/含空格名/空列表/传输三态）、协议门控、路径拼接、**SFTP/FTP 后端双栏渲染** |
+| service 单测 | 19 | 暂存 GC、符号链接安全、**口令散列/认证迁移**、**路径穿越/注入对抗测试**（12 种穿越写法、回滚源路径越权、版本号注入、合法路径不误伤）、Web 令牌随机性、**root/meta 分离（暂存与备份不污染部署根）** |
+| forwarder 单测 | 10 | 口令散列（5）、Web 会话令牌 256bit 随机性、会话上限、**中继审计计数**、老库迁移补列 |
+| client 单测 | 27 | 站点持久化/混淆、**FTP** 列表解析/转义/时间/参数映射、**SFTP** 命令拼接/参数映射/known_hosts/引号转义、**i18n** 查表与回退/持久化/语言码、**字体**扫描、**日志初始化**（stderr + 文件双写、>5MB 滚动） |
+| GUI 冒烟 | 15 | 无显示环境下用 `egui::Context::run()` 跑完整渲染路径：全窗口打开（含**发布/回滚/同步/tail/grep/edit 六个独立窗口**）、边界数据（`..`/含空格名/空列表/传输三态）、协议门控、路径拼接、**SFTP/FTP 后端双栏渲染**；另有纯逻辑回归：`Backups` 应答填版本并清在途标记、tail 行同步进结果编辑窗缓冲 |
 | rdep 集成 | 18 | 直连、发布回滚、目录同步、续传、下载完整性、权限、tail/grep/edit、中转发布、并发中转、双 Web 后台、站点驱动连接、**认证闸门 + 暴力破解节流**、**按项目发布（配置单一来源）**、控制帧向前兼容、**Web 破坏性端点**、**API 令牌认证** |
 | FTP 端到端 | 2 | 对**进程内最小 FTP 服务器**跑通登录/PASV/MLSD/STOR/RETR/改名/删除/含空格文件名 |
 
@@ -287,8 +322,10 @@ FTP 服务端，其 MLSD 输出刻意采用真实服务器格式（分号字段�
 
 - **路径边界**：所有文件操作经 `Storage::resolve()`，拒绝任何 `..`，并二次校验
   结果仍在 root 内。`rollback` 的备份源路径同样经 `resolve()` 后再拼接。
-- **备份保留**：`RDEP_BACKUP_KEEP`（默认 10）自动剪枝最旧版本。
-- **断点续传暂存**：`.rdep-staging/` 由 `RDEP_STAGING_TTL_HOURS`（默认 24h）TTL 回收。
+- **备份保留**：`RDEP_BACKUP_KEEP`（默认 10）自动剪枝最旧版本（存放在 meta 目录）。
+- **断点续传暂存**：`<meta>/.rdep-staging/` 由 `RDEP_STAGING_TTL_HOURS`（默认 24h）TTL 回收。
+- **目录隔离**：部署根（`RDEP_ROOT`）只放业务文件；暂存与备份一律走 meta 目录。
+  `rollback` 的备份源强制位于 meta 内（越权直接拒绝），不会被客户端构造的路径骗到部署根之外。
 - **符号链接**：不跟随链接进入目录（防环），写入不穿链接。
 - **符号链接与路径穿越有专门对抗测试**：`cargo test -p rdep-service --lib`（`storage::security_tests`）。
 - **认证闸门**：除 `AUTH` 外所有指令都必须先认证；`DataChunk` 帧在认证前因不存在活跃传输而自动失效（有专门测试验证未认证请求无任何副作用）。

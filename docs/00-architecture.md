@@ -30,12 +30,20 @@
 
 ## 3. 备份与回滚模型
 
+> **目录分离（重要）**：service 有两个目录——
+> `root`（= `RDEP_ROOT`，对外暴露的部署根，客户端看到的 `/`，**可能只读**）与
+> `meta`（= `RDEP_META`，service 私有工作目录，存放**分片暂存区** `.rdep-staging/` 与
+> **备份库** `backup/`）。二者必须分开：否则部署根不可写时上传直接
+> `Permission denied (os error 13)`，且客户端 `ls /` 会看到内部目录。
+
 - **发布（PUBLISH）**：client 先发 `Publish` 进入发布态，随后逐文件「带备份上传」——
-  service 写新内容前若目标已存在，先把**当前远程文件复制一份**到 `backup/<YYMMDDHHmm>/<相对路径>`；
-  全部文件完成后由 `PublishCommit` 执行重启脚本。
+  service 写新内容前若目标已存在，先把**当前远程文件复制一份**到
+  `<meta>/backup/<YYMMDDHHmm>/<相对路径>`；全部文件完成后由 `PublishCommit` 执行重启脚本。
 - **最大历史备份数**：可配（`RDEP_BACKUP_KEEP`），默认 10；超出时 prune 最旧的版本目录。
-- **回滚（ROLLBACK）**：client 指定某历史版本，service 从 `backup/<version>/<remote_dir>`
-  把文件恢复覆盖到远程目录。
+- **备份在 meta 下，客户端无法用 `Ls` 遍历**：因此枚举版本用独立的 `CmdType::Backups`
+  （命令号 17）→ `BackupsResponse{ versions }`；回滚窗口打开时自动拉一次。
+- **回滚（ROLLBACK）**：client 指定某历史版本，service 从 `<meta>/backup/<version>/<remote_dir>`
+  把文件恢复覆盖到远程目录；备份源强制位于 meta 内，越权拒绝。
   > 实现注记：当前**回滚只恢复文件、不自动执行重启脚本**（重启仅在发布 `PublishCommit` 时触发）。
   > 如需“回滚后重启”，后续可扩展。
 - 备份目录结构与远程目录结构一致，便于整目录恢复。

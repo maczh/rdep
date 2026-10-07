@@ -124,8 +124,11 @@ pub struct RdepApp {
     // 本地新建目录
     local_new_dir: String,
 
-    // 发布 / 回滚
+    // 发布 / 回滚（工具条上拆成两个按钮，各自一个窗口）
     show_publish: bool,
+    show_rollback: bool,
+    /// 目录同步窗口（工具条独立按钮）。
+    show_sync: bool,
     publish_remote: String,
     publish_script: String,
     publish_files: Vec<PublishFile>,
@@ -136,8 +139,13 @@ pub struct RdepApp {
     rollback_version: String,
     pending_backup_list: bool,
 
-    // 工具：tail / grep / edit
-    show_tools: bool,
+    // 工具：tail / grep / edit（从工具条移入「远端文件右键菜单」，针对目标文件执行）
+    show_tail: bool,
+    show_grep: bool,
+    show_edit: bool,
+    /// tail / grep 的结果文本（显示在弹出编辑窗里，可滚动/可复制）。
+    tail_view: String,
+    grep_view: String,
     tail_path: String,
     tail_lines: String,
     tail_follow: bool,
@@ -228,6 +236,8 @@ impl RdepApp {
             rename_input: String::new(),
             local_new_dir: String::new(),
             show_publish: false,
+            show_rollback: false,
+            show_sync: false,
             publish_remote: "/".into(),
             publish_script: "restart".into(),
             publish_files: Vec::new(),
@@ -237,7 +247,11 @@ impl RdepApp {
             backup_versions: Vec::new(),
             rollback_version: String::new(),
             pending_backup_list: false,
-            show_tools: false,
+            show_tail: false,
+            show_grep: false,
+            show_edit: false,
+            tail_view: String::new(),
+            grep_view: String::new(),
             tail_path: "/var/log/messages".into(),
             tail_lines: "50".into(),
             tail_follow: false,
@@ -811,11 +825,27 @@ impl RdepApp {
                 self.edit_content = content;
                 self.edit_loaded = true;
             }
+            Event::BackupVersions { versions } => {
+                tracing::debug!(versions = versions.len(), "backup versions received");
+                self.push_log(&tf("{n} backup version(s)", &[("n", &versions.len().to_string())]));
+                self.backup_versions = versions;
+                self.pending_backup_list = false;
+                if self.backup_versions.is_empty() {
+                    self.push_log(t("(no backups yet)"));
+                }
+            }
             Event::TailLine { line } => {
-                self.tail_output.push(line);
+                self.tail_output.push(line.clone());
                 if self.tail_output.len() > 500 {
                     let drop = self.tail_output.len() - 500;
                     self.tail_output.drain(..drop);
+                }
+                // 结果同步进弹出编辑窗的文本缓冲
+                self.tail_view.push_str(&line);
+                self.tail_view.push('\n');
+                if self.tail_view.len() > 200_000 {
+                    let drop = self.tail_view.len() - 200_000;
+                    self.tail_view.drain(..drop);
                 }
             }
             Event::TailDone { ok, message } => {
@@ -830,7 +860,11 @@ impl RdepApp {
             }
             Event::GrepResult { lines } => {
                 self.push_log(&tf("{n} match(es)", &[("n", &lines.len().to_string())]));
+                self.grep_view = lines.join("\n");
                 self.grep_output = lines;
+                if self.grep_output.is_empty() {
+                    self.grep_view = t("(no output)").to_string();
+                }
             }
             Event::SyncPreview { changed, to_delete } => {
                 self.sync_preview = Some((changed, to_delete));
@@ -1254,6 +1288,33 @@ impl RdepApp {
             self.do_delete(vec![join_remote(&self.remote_dir, &name)]);
             ui.close_menu();
         }
+        // ---- 针对目标文件的工具：tail / grep / edit（原「日志/编辑」工具窗已移除） ----
+        if name != ".." {
+            let target = join_remote(&self.remote_dir, &name);
+            if ui.button(t("Grep")).clicked() {
+                self.grep_path = target.clone();
+                self.grep_view.clear();
+                self.show_grep = true;
+                ui.close_menu();
+            }
+        }
+        if !is_dir && name != ".." {
+            let target = join_remote(&self.remote_dir, &name);
+            if ui.button(t("Tail")).clicked() {
+                self.tail_path = target.clone();
+                self.tail_output.clear();
+                self.tail_view.clear();
+                self.show_tail = true;
+                ui.close_menu();
+            }
+            if ui.button(t("Edit")).clicked() {
+                self.edit_path = target.clone();
+                self.edit_content.clear();
+                self.edit_loaded = false;
+                self.show_edit = true;
+                ui.close_menu();
+            }
+        }
         if !is_dir && name != ".." {
             ui.horizontal(|ui| {
                 ui.label(t("Rename"));
@@ -1440,13 +1501,13 @@ impl RdepApp {
 
     fn publish_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_publish;
-        egui::Window::new(t("Publish / Rollback"))
+        egui::Window::new(t("Publish"))
             .open(&mut open)
             .collapsible(false)
             .default_width(560.0)
             .show(ctx, |ui| {
                 if self.backend.supports_publish() {
-                    self.publish_rollback_inner(ui);
+                    self.publish_inner(ui);
                 } else {
                     ui.colored_label(
                         egui::Color32::from_rgb(200, 120, 40),
@@ -1457,9 +1518,8 @@ impl RdepApp {
         self.show_publish = open;
     }
 
-    /// 发布/回滚（仅 rdep）。拆出以便按协议门控。
-    fn publish_rollback_inner(&mut self, ui: &mut egui::Ui) {
-        // ---- 发布 ----
+    /// 发布（仅 rdep）。拆出以便按协议门控。
+    fn publish_inner(&mut self, ui: &mut egui::Ui) {
         ui.strong(t("Publish (backup old files → upload → run restart script)"));
         labeled(ui, t("Remote dir"), &mut self.publish_remote);
         labeled(ui, t("Restart script id"), &mut self.publish_script);
@@ -1508,15 +1568,37 @@ impl RdepApp {
             }
         }
 
-        ui.separator();
-        // ---- 回滚 ----
+    }
+
+    /// 回滚窗口（工具条上是独立按钮，与发布分开）。
+    fn rollback_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_rollback;
+        egui::Window::new(t("Rollback"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                if self.backend.supports_publish() {
+                    self.rollback_inner(ui);
+                } else {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 120, 40),
+                        t("SFTP: publish/rollback require the rdep service and are unavailable."),
+                    );
+                }
+            });
+        self.show_rollback = open;
+    }
+
+    /// 回滚表单（仅 rdep）。
+    fn rollback_inner(&mut self, ui: &mut egui::Ui) {
         ui.strong(t("Rollback (restore a backup version to the remote dir)"));
         labeled(ui, t("Remote dir"), &mut self.rollback_remote);
         ui.horizontal(|ui| {
             if ui.button(t("List backup versions")).clicked() {
                 if self.connected {
                     self.pending_backup_list = true;
-                    self.ls_remote("/backup");
+                    self.client.list_backups();
                 } else {
                     self.push_log(t("Not connected, cannot list backups"));
                 }
@@ -1558,8 +1640,30 @@ impl RdepApp {
             }
         }
 
-        ui.separator();
-        // ---- 目录同步（rdep 与 SFTP 均支持） ----
+    }
+
+    /// 目录同步窗口（工具条独立按钮）。
+    fn sync_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_sync;
+        egui::Window::new(t("Directory sync"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                if self.backend.supports_advanced() {
+                    self.sync_inner(ui);
+                } else {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 120, 40),
+                        t("FTP only supports basic file operations; publish/rollback, directory sync, tail/grep, edit, resume and relay are rdep-only. FTP is plaintext."),
+                    );
+                }
+            });
+        self.show_sync = open;
+    }
+
+    /// 目录同步表单。
+    fn sync_inner(&mut self, ui: &mut egui::Ui) {
         ui.strong(t("Directory sync (local → remote; changed = size+mtime; auto-backup before overwrite)"));
         labeled(ui, t("Local dir"), &mut self.sync_local);
         labeled(ui, t("Remote dir"), &mut self.sync_remote);
@@ -1611,102 +1715,119 @@ impl RdepApp {
         }
     }
 
-    fn tools_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_tools;
-        egui::Window::new(t("Log / Search / Edit"))
+    /// TAIL 弹出窗：对**指定远端文件**查看末尾若干行（可跟随），结果在编辑框中。
+    fn tail_dialog(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_tail;
+        egui::Window::new(t("Tail"))
             .open(&mut open)
             .collapsible(false)
-            .default_width(720.0)
-            .default_height(560.0)
+            .default_width(680.0)
+            .default_height(460.0)
             .show(ctx, |ui| {
-                // ---- TAIL ----
-                ui.strong(t("TAIL (view log tail; optional follow)"));
                 labeled(ui, t("Remote file"), &mut self.tail_path);
                 ui.horizontal(|ui| {
                     ui.label(t("Tail lines"));
-                    ui.text_edit_singleline(&mut self.tail_lines);
+                    ui.add(egui::TextEdit::singleline(&mut self.tail_lines).desired_width(70.0));
                     ui.checkbox(&mut self.tail_follow, t("Follow"));
-                    if ui.button(t("Start")).clicked() {
-                        if self.connected {
+                    if ui.button(t("Execute")).clicked() {
+                        if !self.connected {
+                            self.push_log(t("Not connected, cannot tail"));
+                        } else if self.require_advanced("Tail") {
                             self.tail_output.clear();
+                            self.tail_view.clear();
                             let n: u32 = self.tail_lines.trim().parse().unwrap_or(50);
                             self.do_tail(self.tail_path.clone(), n, self.tail_follow);
-                        } else {
-                            self.push_log(t("Not connected, cannot tail"));
                         }
                     }
-                    if ui.button(t("Stop follow")).clicked() {
+                    if self.tail_follow && ui.button(t("Stop follow")).clicked() {
                         self.do_stop_tail();
                     }
                 });
-                egui::ScrollArea::vertical()
-                    .max_height(180.0)
-                    .show(ui, |ui| {
-                        if self.tail_output.is_empty() {
-                            ui.label(t("(no output)"));
-                        }
-                        for l in &self.tail_output {
-                            ui.monospace(l);
-                        }
-                    });
-
                 ui.separator();
-                // ---- GREP ----
-                ui.strong(t("GREP (search content; flags: i=ignore-case n=line-number)"));
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.tail_view)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
+            });
+        self.show_tail = open;
+    }
+
+    /// GREP 弹出窗：在指定文件/目录中检索，结果在编辑框中。
+    fn grep_dialog(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_grep;
+        egui::Window::new(t("Grep"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(680.0)
+            .default_height(460.0)
+            .show(ctx, |ui| {
                 labeled(ui, t("Path"), &mut self.grep_path);
                 labeled(ui, t("Pattern"), &mut self.grep_pattern);
                 labeled(ui, t("Flags"), &mut self.grep_flags);
-                if ui.button(t("Search")).clicked() {
-                    if self.connected {
+                if ui.button(t("Execute")).clicked() {
+                    if !self.connected {
+                        self.push_log(t("Not connected, cannot grep"));
+                    } else if self.require_advanced("Grep") {
+                        self.grep_view.clear();
                         self.do_grep(
                             self.grep_path.clone(),
                             self.grep_pattern.clone(),
                             self.grep_flags.clone(),
                         );
-                    } else {
-                        self.push_log(t("Not connected, cannot grep"));
                     }
                 }
-                egui::ScrollArea::vertical()
-                    .max_height(160.0)
-                    .show(ui, |ui| {
-                        if self.grep_output.is_empty() {
-                            ui.label(t("(no output)"));
-                        }
-                        for l in &self.grep_output {
-                            ui.monospace(l);
-                        }
-                    });
-
                 ui.separator();
-                // ---- EDIT ----
-                ui.strong(t("EDIT (remote editing; auto-backup before save)"));
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.grep_view)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
+            });
+        self.show_grep = open;
+    }
+
+    /// 远端文件编辑窗：加载 → 编辑 → 保存（服务端保存前自动备份）。
+    fn edit_dialog(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_edit;
+        egui::Window::new(t("Edit remote file"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(680.0)
+            .default_height(500.0)
+            .show(ctx, |ui| {
                 labeled(ui, t("Remote file"), &mut self.edit_path);
                 ui.horizontal(|ui| {
                     if ui.button(t("Load")).clicked() {
-                        if self.connected {
-                            self.do_edit_get(self.edit_path.clone());
-                        } else {
+                        if !self.connected {
                             self.push_log(t("Not connected, cannot load"));
+                        } else if self.require_advanced("Edit") {
+                            self.do_edit_get(self.edit_path.clone());
                         }
                     }
                     let loaded = self.edit_loaded;
-                    if ui
-                        .add_enabled(loaded, egui::Button::new(t("Save")))
-                        .clicked()
-                    {
-                        if self.connected {
-                            self.do_edit_save(
-                                self.edit_path.clone(),
-                                self.edit_content.clone(),
-                            );
-                        } else {
+                    if ui.add_enabled(loaded, egui::Button::new(t("Save"))).clicked() {
+                        if !self.connected {
                             self.push_log(t("Not connected, cannot save"));
+                        } else {
+                            self.do_edit_save(self.edit_path.clone(), self.edit_content.clone());
                         }
                     }
+                    if loaded {
+                        ui.label(t("(loaded; edits are saved with auto-backup on the server)"));
+                    }
                 });
+                ui.separator();
                 egui::ScrollArea::vertical()
-                    .max_height(220.0)
+                    .max_height(360.0)
                     .show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut self.edit_content)
@@ -1715,7 +1836,7 @@ impl RdepApp {
                         );
                     });
             });
-        self.show_tools = open;
+        self.show_edit = open;
     }
 
     /// 站点管理器：列出已保存站点 / 保存当前配置 / 删除 / 双击载入到连接表单。
@@ -1904,14 +2025,18 @@ impl RdepApp {
                 } else if ui.button(t("Connect")).clicked() {
                     self.show_connect = true;
                 }
-                if ui.button(t("Publish/Rollback")).clicked() {
-                    if self.require_publish("Publish/Rollback") {
-                        self.show_publish = true;
-                    }
+                if ui.button(t("Publish")).clicked() && self.require_publish("Publish") {
+                    self.show_publish = true;
                 }
-                if ui.button(t("Logs/Tools")).clicked() {
-                    if self.require_advanced("Logs/Tools") {
-                        self.show_tools = true;
+                if ui.button(t("Sync")).clicked() && self.require_advanced("Directory sync") {
+                    self.show_sync = true;
+                }
+                if ui.button(t("Rollback")).clicked() && self.require_publish("Rollback") {
+                    self.show_rollback = true;
+                    // 打开时自动拉一次备份版本列表（需要已连接）
+                    if self.connected {
+                        self.pending_backup_list = true;
+                        self.client.list_backups();
                     }
                 }
                 ui.separator();
@@ -1998,8 +2123,20 @@ impl RdepApp {
         if self.show_publish {
             self.publish_window(ctx);
         }
-        if self.show_tools {
-            self.tools_window(ctx);
+        if self.show_rollback {
+            self.rollback_window(ctx);
+        }
+        if self.show_tail {
+            self.tail_dialog(ctx);
+        }
+        if self.show_grep {
+            self.grep_dialog(ctx);
+        }
+        if self.show_sync {
+            self.sync_window(ctx);
+        }
+        if self.show_edit {
+            self.edit_dialog(ctx);
         }
 
         ctx.request_repaint_after(Duration::from_millis(50));
@@ -2197,9 +2334,14 @@ mod gui_smoke {
         }];
         app.backup_versions = vec!["2601071200".into(), "2601071300".into()];
         app.rollback_version = "2601071200".into();
+        // 回滚已拆成独立工具条按钮与独立窗口，这里一并渲染（含版本列表）
+        app.show_rollback = true;
         app.sync_preview = Some((vec!["a.txt".into(), "b.txt".into()], vec!["stale.txt".into()]));
 
-        app.show_tools = true;
+        app.show_tail = true;
+        app.show_grep = true;
+        app.show_edit = true;
+        app.show_sync = true;
         app.tail_output = vec!["line1".into(), "ERROR bad".into()];
         app.grep_output = vec!["file.txt:3:ERROR bad".into()];
         app.edit_loaded = true;
@@ -2389,6 +2531,39 @@ mod gui_smoke {
         app.push_log("hello");
         let last = app.log.last().unwrap().clone();
         assert!(last.starts_with('[') && last.contains("hello"), "日志应带时间戳: {last}");
+    }
+
+    /// 回归：回滚拆成独立按钮后，版本列表走新增的 `Backups` 指令；
+    /// 应答要填进 `backup_versions` 并清掉在途标记（否则下次打开窗口会一直空）。
+    #[test]
+    fn backup_versions_event_fills_list_and_clears_pending() {
+        let mut app = test_app("backups");
+        app.pending_backup_list = true;
+        app.handle(Event::BackupVersions {
+            versions: vec!["2601071200".into(), "2601071300".into()],
+        });
+        assert_eq!(app.backup_versions.len(), 2, "应填入 2 个备份版本");
+        assert!(
+            !app.pending_backup_list,
+            "BackupVersions 到达后必须清掉在途标记"
+        );
+        assert!(app.log.iter().any(|l| l.contains("2")), "日志应记录版本数");
+
+        // 空列表要有明确提示，而不是静默空白
+        let mut app2 = test_app("backups-empty");
+        app2.handle(Event::BackupVersions { versions: vec![] });
+        assert!(app2.backup_versions.is_empty());
+        assert!(app2.log.iter().any(|l| l.contains("no backups")));
+    }
+
+    /// 回归：tail 结果要同步进结果编辑窗的文本缓冲（右键菜单 → 执行 → 结果编辑窗）。
+    #[test]
+    fn tail_line_fills_result_edit_buffer() {
+        let mut app = test_app("tailbuf");
+        app.handle(Event::TailLine { line: "line-1".into() });
+        app.handle(Event::TailLine { line: "line-2".into() });
+        assert_eq!(app.tail_output.len(), 2);
+        assert_eq!(app.tail_view, "line-1\nline-2\n", "结果编辑窗缓冲应逐行追加");
     }
 
     /// 远端路径拼接工具函数。

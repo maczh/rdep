@@ -10,7 +10,8 @@ use anyhow::{Context, Result};
 use rdep_protocol::transport::FrameCodec;
 use rdep_protocol::relay::{RelayConnect, RelayConnectResp};
 use rdep_protocol::{
-    AuthMethod, AuthRequest, CmdRequest, CmdResponse, CmdType, Ctrl, DataChunk, DeleteRequest,
+    AuthMethod, AuthRequest, BackupsRequest, BackupsResponse, CmdRequest, CmdResponse, CmdType, Ctrl,
+    DataChunk, DeleteRequest,
     Direction, DownloadRequest, EditRequest, FileEntry, Frame, FrameFlags, FrameType, GrepRequest,
     GrepResponse, LsRequest, LsResponse, MkdirRequest, MoveRequest, CopyPolicy, CopyRequest,
     NamePolicy, PublishCommitRequest, PublishItem, PublishRequest, RenameRequest,
@@ -58,6 +59,11 @@ pub enum Command {
     },
     /// 回滚：把某个备份版本恢复到远端目录。
     Rollback { remote_dir: String, version: String },
+    /// 列出服务端备份版本（回滚下拉框数据源）。
+    ///
+    /// 备份库在 service 的私有工作目录（meta），**不在部署根之下**，
+    /// 因此不能靠 `Ls /backup` 取（备份位置一变就失效），走专用指令。
+    ListBackups,
     /// 实时查看日志尾部。
     Tail {
         path: String,
@@ -109,6 +115,8 @@ pub enum Event {
         changed: Vec<String>,
         to_delete: Vec<String>,
     },
+    /// 备份版本列表（回滚下拉框数据源）。
+    BackupVersions { versions: Vec<String> },
     /// edit 读取到的远端文件内容。
     EditLoaded { content: String },
 }
@@ -350,6 +358,10 @@ impl Client {
             .cmd_tx
             .blocking_send(Command::Rollback { remote_dir, version });
     }
+    /// 列出备份版本（服务端返回后以 `Event::BackupVersions` 回传）。
+    pub fn list_backups(&self) {
+        let _ = self.cmd_tx.blocking_send(Command::ListBackups);
+    }
     /// tail：查看文件尾部，`follow` 为真时持续跟随（用 request_stop_tail 停止）。
     pub fn tail(&self, path: String, lines: u32, follow: bool) {
         let _ = self
@@ -551,6 +563,10 @@ async fn client_task(
                     );
                 }
             }
+            Command::ListBackups => match &mut session {
+                Some(s) => do_backups(s, &evt_tx).await,
+                None => send(&evt_tx, Event::Error("not connected".into())),
+            },
             Command::Rollback { remote_dir, version } => {
                 if let Some(s) = &mut session {
                     do_rollback(s, &remote_dir, &version, &evt_tx).await;
@@ -882,6 +898,38 @@ async fn do_ls_recursive(s: &mut Session, path: &str) -> Vec<FileEntry> {
         Ok(v) => v.entries,
         Err(_) => Vec::new(),
     }
+}
+
+async fn do_backups(s: &mut Session, evt: &std_mpsc::Sender<Event>) {
+    tracing::debug!("backups: sending request");
+    let resp = match (async {
+        send_cmd(&mut s.codec, &mut s.seq, CmdType::Backups, &BackupsRequest {}).await?;
+        read_response(&mut s.codec).await
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("backups failed: {e:#}");
+            send(evt, Event::Error(format!("list backups failed: {e:#}")));
+            return;
+        }
+    };
+    if !resp.ok {
+        tracing::error!(message = %resp.message, "backups rejected by server");
+        send(evt, Event::Error(format!("backups: {}", resp.message)));
+        return;
+    }
+    let br: BackupsResponse = match postcard::from_bytes(&resp.body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("backups decode failed: {e}");
+            send(evt, Event::Error(format!("backups decode: {e}")));
+            return;
+        }
+    };
+    tracing::debug!(versions = br.versions.len(), "backups: response decoded");
+    send(evt, Event::BackupVersions { versions: br.versions });
 }
 
 async fn do_simple<T: Serialize>(

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 服务端运行配置。
 #[derive(Clone)]
@@ -27,6 +27,13 @@ pub struct ServiceConfig {
     pub max_sessions: usize,
     /// 断点续传暂存目录保留时长（小时）；超过则视为中断上传并回收。env `RDEP_STAGING_TTL_HOURS`，默认 24。
     pub staging_ttl_hours: u64,
+    /// service 私有工作目录：存放断点续传暂存区与备份版本库。
+    ///
+    /// **必须可写，且应与 `root_dir` 分开**：早期实现把暂存区/备份建在部署根之下，
+    /// 于是 `RDEP_ROOT=/`（或只读部署目录）时上传直接 `Permission denied`，
+    /// 且客户端 `ls /` 会看到 `.rdep-staging`、`backup` 等内部目录。
+    /// env `RDEP_META`，默认 `<cwd>/data/meta`。
+    pub meta_dir: PathBuf,
 }
 
 impl ServiceConfig {
@@ -41,9 +48,18 @@ impl ServiceConfig {
         let cwd = std::env::current_dir()?;
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let get = |k: &str, d: PathBuf| std::env::var(k).map(PathBuf::from).unwrap_or(d);
+        // 注意：默认值是文件系统根 `/`（不是 cwd）——`Path::join` 遇到绝对路径会整体替换，
+        // 这里直接写绝对形式，避免误导（也顺带消除 clippy 的 suspicious_join 告警）。
+        let root_dir = get("RDEP_ROOT", PathBuf::from("/"));
+        // 未显式指定 RDEP_META 时，按 root 派生一个**互不干扰**的工作目录：
+        // 若所有实例共用一个 meta，并发测试/多实例会互相踩备份库与暂存区。
+        let default_meta = cwd
+            .join("data")
+            .join("meta")
+            .join(sanitize_path_component(&root_dir));
         Ok(Self {
             listen_addr: std::env::var("RDEP_LISTEN").unwrap_or_else(|_| "0.0.0.0:8443".to_string()),
-            root_dir: get("RDEP_ROOT", cwd.join("/")),
+            root_dir,
             cert_path: get("RDEP_CERT", manifest.join("certs/server.crt")),
             key_path: get("RDEP_KEY", manifest.join("certs/server.key")),
             db_path: get("RDEP_DB", cwd.join("data/rdep.db")),
@@ -71,6 +87,22 @@ impl ServiceConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(24),
+            meta_dir: get("RDEP_META", default_meta),
         })
+    }
+}
+
+/// 把任意路径压成一个安全的单层目录名（用于按 root 派生 meta 目录）。
+fn sanitize_path_component(p: &Path) -> String {
+    let s: String = p
+        .display()
+        .to_string()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    if s.is_empty() {
+        "root".to_string()
+    } else {
+        s
     }
 }

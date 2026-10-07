@@ -4,8 +4,21 @@ use anyhow::{Context, Result};
 use rdep_protocol::{FileEntry, LsRequest, LsResponse};
 
 /// 远程文件系统访问层：所有路径都被约束在 `root` 之内（防 `..` 越权）。
+///
+/// `root` 与 `meta` 是**两个不同的目录**：
+/// - `root`  = 对外暴露的部署根目录（客户端看到的 `/`），可能是只读或不可写
+///   （如 `RDEP_ROOT=/` 而 service 以普通用户运行）；
+/// - `meta`  = service 自己的**工作目录**（断点续传暂存区、备份版本库），
+///   必须始终可写，且**不混进部署目录**（否则客户端 `ls /` 会看到
+///   `.rdep-staging`、`backup` 这类内部目录，造成困惑）。
+///
+/// 早期实现把暂存区与备份都建在 `root` 之下，于是 `RDEP_ROOT=/` 时上传直接
+/// `Permission denied (os error 13)`（无法在 `/` 下建 `.rdep-staging`）。
+/// 现在二者分离；`Storage::new` 保留 `meta = root` 的旧行为以兼容既有测试。
 pub struct Storage {
     root: PathBuf,
+    /// service 私有工作目录（暂存区 / 备份库）。默认等于 root（兼容旧行为）。
+    meta: PathBuf,
     /// 保留的备份版本数（超过则剪枝最旧的）。
     backup_keep: usize,
 }
@@ -15,7 +28,27 @@ impl Storage {
         std::fs::create_dir_all(&root).context("create root dir")?;
         let root = std::fs::canonicalize(&root).context("canonicalize root dir")?;
         Ok(Self {
+            root: root.clone(),
+            meta: root,
+            backup_keep: backup_keep.max(1),
+        })
+    }
+
+    /// 指定独立工作目录（`meta`）构造：`root` 只作部署根，`meta` 承载暂存与备份。
+    /// 生产环境**必须**用这个构造函数，否则 `RDEP_ROOT=/` 这类只读根会上传失败。
+    pub fn with_meta(root: PathBuf, meta: PathBuf, backup_keep: usize) -> Result<Self> {
+        std::fs::create_dir_all(&root).context("create root dir")?;
+        let root = std::fs::canonicalize(&root).context("canonicalize root dir")?;
+        std::fs::create_dir_all(&meta).with_context(|| format!("create meta dir {}", meta.display()))?;
+        let meta = std::fs::canonicalize(&meta).context("canonicalize meta dir")?;
+        tracing::info!(
+            root = %root.display(),
+            meta = %meta.display(),
+            "storage: root (deployment) and meta (staging/backup) separated",
+        );
+        Ok(Self {
             root,
+            meta,
             backup_keep: backup_keep.max(1),
         })
     }
@@ -24,6 +57,11 @@ impl Storage {
     /// 「客户端看到的 `/` 到底是什么目录」这一疑问的唯一权威答案。
     pub fn root_display(&self) -> String {
         self.root.display().to_string()
+    }
+
+    /// 私有工作目录（暂存区 / 备份库）——排障「上传 Permission denied」时先看它是否可写。
+    pub fn meta_display(&self) -> String {
+        self.meta.display().to_string()
     }
 
     /// 将协议层传来的（可能含前导 `/` 与 `..`）路径解析为 root 内的绝对路径。
@@ -168,7 +206,8 @@ impl Storage {
     // 的 chunk 文件，无需额外位图持久化，天然支持跨连接/跨会话续传。
 
     fn staging_dir(&self, transfer_id: u64) -> PathBuf {
-        self.root.join(".rdep-staging").join(transfer_id.to_string())
+        // 暂存区在 meta（service 私有、保证可写），绝不放在 root 之下
+        self.meta.join(".rdep-staging").join(transfer_id.to_string())
     }
 
     /// 列出某传输已暂存的分片序号（升序）。
@@ -220,7 +259,7 @@ impl Storage {
     /// 清理「陈旧」的暂存目录：超过 `max_age` 未被修改的传输视为已放弃
     /// （client 中断上传后再未续传），回收其磁盘占用。返回回收的目录数。
     pub fn cleanup_stale_staging(&self, max_age: std::time::Duration) -> Result<usize> {
-        let base = self.root.join(".rdep-staging");
+        let base = self.meta.join(".rdep-staging");
         if !base.is_dir() {
             return Ok(0);
         }
@@ -262,7 +301,7 @@ impl Storage {
                 .strip_prefix(&self.root)
                 .unwrap_or(&dest)
                 .to_path_buf();
-            let backup_path = self.root.join("backup").join(&version).join(&rel);
+            let backup_path = self.backup_root().join(&version).join(&rel);
             if let Some(p) = backup_path.parent() {
                 std::fs::create_dir_all(p)?;
             }
@@ -274,9 +313,14 @@ impl Storage {
         self.save(&dest, data)
     }
 
+    /// 备份库根目录（在 meta 下，不污染部署目录）。
+    fn backup_root(&self) -> PathBuf {
+        self.meta.join("backup")
+    }
+
     /// 列出已有的备份版本（版本号字符串，升序）。版本号即 `backup/` 下的目录名。
     pub fn list_backup_versions(&self) -> Result<Vec<String>> {
-        let backup_root = self.root.join("backup");
+        let backup_root = self.backup_root();
         if !backup_root.is_dir() {
             return Ok(Vec::new());
         }
@@ -304,10 +348,11 @@ impl Storage {
         // 造成任意目录读取（copy 到部署目录后即可下载）。
         let dest_base = self.resolve(remote_dir)?;
         let rel = dest_base.strip_prefix(&self.root).unwrap_or(&dest_base);
-        let backup_dir = self.root.join("backup").join(version).join(rel);
-        // 兜底：拼接结果必须仍在 root 内（防止将来新增拼接方式时重蹈覆辙）。
-        if !backup_dir.starts_with(&self.root) {
-            anyhow::bail!("path escapes root: {}", remote_dir);
+        let backup_dir = self.backup_root().join(version).join(rel);
+        // 兜底：备份源必须仍在 meta 工作目录内（防止任意目录读取）。
+        if !backup_dir.starts_with(&self.meta) {
+            tracing::error!(dir = %remote_dir, version, "rollback: backup source escapes meta dir");
+            anyhow::bail!("path escapes backup store: {}", remote_dir);
         }
         if !backup_dir.is_dir() {
             anyhow::bail!("backup version not found: {}", version);
@@ -401,7 +446,7 @@ impl Storage {
 
     /// 剪枝最旧的备份版本，仅保留 `backup_keep` 个。
     fn prune_backups(&self) -> Result<()> {
-        let backup_root = self.root.join("backup");
+        let backup_root = self.backup_root();
         if !backup_root.is_dir() {
             return Ok(());
         }
@@ -531,6 +576,70 @@ fn mode_of(m: &std::fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn mode_of(_m: &std::fs::Metadata) -> u32 {
     0
+}
+
+#[cfg(test)]
+mod meta_dir_tests {
+    //! 回归：断点续传暂存区与备份库必须落在 **meta 工作目录**，不得出现在部署根下。
+    //!
+    //! 背景（`RDEP_ROOT=/` 上传报 `Permission denied (os error 13)`）：
+    //! 早期实现把暂存区/备份都建在 root 之下，部署根不可写时上传直接失败；
+    //! 同时客户端 `ls /` 会看到 `.rdep-staging`、`backup` 这类内部目录。
+
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("rdep-meta-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn staging_and_backup_do_not_pollute_root() {
+        let base = tmp("sep");
+        let root = base.join("root");
+        let meta = base.join("meta");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let s = Storage::with_meta(root.clone(), meta.clone(), 10).expect("storage");
+
+        // 写文件 + 触发一次备份（覆盖已有文件才会备份）
+        // 用目录承载目标文件：rollback 的语义是「把某版本恢复到 remote_dir」（目录级）
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(root.join("app").join("app.txt"), b"v0").unwrap();
+        s.save_with_backup("/app/app.txt", b"v1").expect("save with backup");
+
+        // 断点续传暂存
+        s.stage_chunk(4242, 0, b"chunk").expect("stage chunk");
+
+        // 部署根下不得出现内部目录
+        assert!(
+            !root.join(".rdep-staging").exists(),
+            "暂存区不得建在部署根下"
+        );
+        assert!(!root.join("backup").exists(), "备份库不得建在部署根下");
+
+        // 它们应该在 meta 下，且内容正确
+        assert!(meta.join(".rdep-staging").join("4242").is_dir(), "暂存区应在 meta 下");
+        assert!(meta.join("backup").is_dir(), "备份库应在 meta 下");
+        assert_eq!(std::fs::read(root.join("app").join("app.txt")).unwrap(), b"v1");
+        let versions = s.list_backup_versions().expect("list versions");
+        assert_eq!(versions.len(), 1, "应产生一个备份版本");
+
+        // ls 只看到真实目录（这是用户在客户端看到的 `/`）
+        let listed = s
+            .ls(&LsRequest { path: "/".into(), recursive: false })
+            .expect("ls");
+        let names: Vec<&str> = listed.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["app"], "客户端看到的 / 不应含内部目录: {names:?}");
+
+        // 回滚仍可用（备份源在 meta，恢复到 root 下的目录）
+        s.rollback("/app", &versions[0]).expect("rollback");
+        assert_eq!(std::fs::read(root.join("app").join("app.txt")).unwrap(), b"v0");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 #[cfg(test)]

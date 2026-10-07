@@ -42,6 +42,32 @@ fn rdep_live_connect_localhost_9443() {
                 println!("event: {ev:?}");
                 events.push(ev);
                 if matches!(events.last(), Some(Event::Connected)) {
+                    // 可选：上传一个本地文件（RDEP_LIVE_UPLOAD=<本地文件>），
+                    // 目标路径用 RDEP_LIVE_UPLOAD_TO 指定（默认 /tmp/rdep-live-upload.bin）。
+                    // 用途：验证「部署根不可写（如 RDEP_ROOT=/ 且 service 非 root）」
+                    // 时上传是否成功——暂存区必须落在 service 私有 meta 目录而非部署根。
+                    if let Ok(local) = std::env::var("RDEP_LIVE_UPLOAD") {
+                        let remote = std::env::var("RDEP_LIVE_UPLOAD_TO")
+                            .unwrap_or_else(|_| "/tmp/rdep-live-upload.bin".into());
+                        c.upload(remote.clone(), local.clone());
+                        let deadline3 = std::time::Instant::now() + Duration::from_secs(20);
+                        while std::time::Instant::now() < deadline3 {
+                            if let Some(ev) = c.recv_timeout(Duration::from_millis(300)) {
+                                println!("upload event: {ev:?}");
+                                match ev {
+                                    Event::TransferDone { ok: true, .. } => {
+                                        println!("UPLOAD OK: {local} -> {remote}");
+                                        break;
+                                    }
+                                    Event::TransferDone { ok: false, message, .. } => {
+                                        panic!("UPLOAD FAILED: {message}");
+                                    }
+                                    Event::Error(e) => panic!("UPLOAD ERROR: {e}"),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                     // 可选：连上后列目录，用于验证真实文件系统浏览（RDEP_LIVE_LS=/path）
                     if let Ok(dir) = std::env::var("RDEP_LIVE_LS") {
                         c.ls(&dir);

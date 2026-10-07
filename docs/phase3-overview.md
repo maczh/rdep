@@ -17,6 +17,12 @@
 ## 服务端（rdep-service）
 ### Storage（`storage.rs`）
 - 新增 `backup_keep`（默认 10，可用 env `RDEP_BACKUP_KEEP` 覆盖）。
+> **后续变更（Phase 3 之后）**：备份库与分片暂存区已从部署根迁到 service 私有目录
+> **`meta`**（`RDEP_META`）——即下面的 `backup/<...>` 实际是 `<meta>/backup/<...>`，
+> `.rdep-staging` 是 `<meta>/.rdep-staging`。起因是部署根只读时上传报
+> `stage chunk …: Permission denied (os error 13)`。同时新增 `CmdType::Backups = 17`
+> 供客户端枚举版本（`ls /backup` 已不可用）。
+
 - `save_with_backup(remote_path, data)`：写入前若目标已存在，先复制到
   `backup/<YYMMDDHHmm>/<相对路径>`，再写新内容；超出保留上限时剪枝最旧版本。
 - `list_backup_versions()`：列出 `backup/` 下所有版本（升序）。

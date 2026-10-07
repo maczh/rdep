@@ -27,8 +27,13 @@ RUST_LOG=rdep_client=trace,rdep_service=debug   # 分模块细调
 启动第一行即**生效配置**（回答「远程 `/` 到底是哪个目录」）：
 
 ```
-INFO  rdep-service configuration resolved listen=127.0.0.1:19443 root=/ db=… scripts=… cert=… backup_keep=10 forwarder=false
+INFO  rdep-service configuration resolved listen=127.0.0.1:19443 root=/ meta=/home/…/data/meta/_ db=… scripts=… cert=… backup_keep=10 forwarder=false
 ```
+
+> `root=` 是**部署目录**（可只读）；`meta=` 是 service 私有工作目录，
+> 分片暂存 `.rdep-staging/` 与备份 `backup/` 都在这里。启动日志还会打一行
+> `storage: root (deployment) and meta (staging/backup) separated root=… meta=…`。
+> 上传报 `stage chunk …: Permission denied` 时，**先看 `meta=` 指向的目录是否可写**。
 
 之后每条连接：
 
@@ -48,7 +53,7 @@ DEBUG ls: ok peer="…" path=/ entries=25
 ```
 
 覆盖的指令：`Auth / Ls / Mkdir / Upload(init,commit) / Download / Delete / Copy / Move /
-Rename / Publish / PublishCommit / Rollback / Tail / Grep / Edit / Ping`，
+Rename / Publish / PublishCommit / Rollback / Backups / Tail / Grep / Edit / Ping`，
 每条都记录**入参**（路径、长度、标志位）与**返回值**（ok、message、条目数、字节数）；
 失败分支从 `?` 改为显式 `warn` + 错误响应，不再默默断连。
 `storage` 层额外记录 `requested → resolved` 的路径解析结果（沙箱边界取证）。
@@ -81,10 +86,12 @@ DEBUG action: upload backend=Rdep local=… remote=…
 | 点了 Refresh 没变化 | 无 `Listing …` 日志说明按钮没触发；有则说明应答被处理 | 旧 bug：残留的 `pending_tree_ls` 把主面板应答吞进树缓存。现已在 Error/Disconnected/Refresh 时清理 |
 | 连接失败 | `connect failed: {完整错误链}` | `no CA cert configured` / `read CA cert …` / `invalid peer certificate …` 按提示核对 |
 | 认证失败 | `auth failed: invalid credentials` | 服务端 `auth: invalid credentials user=… failures=N`（同一连接连续失败 5 次后要求重连） |
+| 上传报 `stage chunk N of transfer <id>: Permission denied (os error 13)` | `UPLOAD FAILED: commit resp: read response` 或 `stage chunk …` | ✅ 旧版把分片暂存区建在**部署根**下（`<RDEP_ROOT>/.rdep-staging/`），部署根不可写（如 `RDEP_ROOT=/` 且 service 非 root）必然 EACCES；现暂存与备份都在 `RDEP_META`。服务端会同时在 `session: handler error, closing: stage chunk …` 与 `session ended: …` 打 WARN，两侧按 `transfer_id` 对照 |
+| 回滚窗口没有版本列表 | `BackupVersions` 事件未到达 / 为空 | 备份已移到 meta，客户端用新增的 `Backups` 指令（命令号 17）取版本；服务端 `backups: request` → `backups: ok versions=N` |
 
 ## 6. 回归测试
 
-针对本次修复新增 4 条 GUI 单测（`crates/rdep-client/src/app.rs::gui_smoke`）：
+针对本次修复新增 GUI 单测（`crates/rdep-client/src/app.rs::gui_smoke`）：
 
 - `stale_pending_tree_ls_is_cleared_on_error_and_disconnect`
 - `dir_listed_updates_main_pane_after_stale_tree_marker`

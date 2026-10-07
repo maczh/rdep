@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rdep_protocol::{
-    AuthMethod, AuthRequest, AuthResponse, CmdRequest, CmdResponse, CmdType, CopyPolicy,
+    AuthMethod, AuthRequest, AuthResponse, BackupsResponse, CmdRequest, CmdResponse, CmdType, CopyPolicy,
     CopyRequest, Ctrl, DataChunk, DeleteRequest, DownloadRequest, EditRequest, ErrorCode, Frame,
     FrameFlags, FrameType, GrepRequest, GrepResponse, LsRequest, MkdirRequest, MoveRequest,
     PublishCommitRequest, PublishRequest, RenameRequest, RollbackRequest, StreamPush, TailRequest,
@@ -867,6 +867,26 @@ where
                     }
                 }
             }
+        }
+
+        CmdType::Backups => {
+            tracing::debug!(peer, "backups: request");
+            let versions = match storage.list_backup_versions() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(peer, "backups: failed: {e:#}");
+                    return Ok(Some(make_response(
+                        req,
+                        false,
+                        ErrorCode::PathNotFound,
+                        &format!("list backups failed: {e:#}"),
+                        vec![],
+                    )));
+                }
+            };
+            tracing::debug!(peer, versions = versions.len(), "backups: ok");
+            let body = postcard::to_allocvec(&BackupsResponse { versions })?;
+            Ok(Some(make_response(req, true, ErrorCode::Ok, "", body)))
         }
 
         CmdType::Ping => {

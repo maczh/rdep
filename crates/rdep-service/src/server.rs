@@ -30,13 +30,20 @@ pub async fn run_service_until(
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(10);
-    let storage = Arc::new(Storage::new(config.root_dir.clone(), backup_keep)?);
+    // 部署根（root）与私有工作目录（meta）分离：root 可能只读/不可写，
+    // 暂存区与备份库一律放 meta，避免 `RDEP_ROOT=/` 时上传 Permission denied。
+    let storage = Arc::new(Storage::with_meta(
+        config.root_dir.clone(),
+        config.meta_dir.clone(),
+        backup_keep,
+    )?);
     let db = Arc::new(Db::open(&config.db_path)?);
 
     // 生效配置一览：排查「看到的目录不对」类问题时，第一行要看的就是 RDEP_ROOT
     tracing::info!(
         listen = %config.listen_addr,
         root = %storage.root_display(),
+        meta = %storage.meta_display(),
         db = %config.db_path.display(),
         scripts = %config.scripts_dir.display(),
         cert = %config.cert_path.display(),

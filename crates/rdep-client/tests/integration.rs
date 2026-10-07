@@ -103,6 +103,7 @@ fn start_service(
         key_path: certs_dir().join("server.key"),
         db_path: db.to_path_buf(),
         scripts_dir: scripts.to_path_buf(),
+        meta_dir: db.with_extension("meta"),
         web_listen: web_port.map(|p| format!("127.0.0.1:{p}")),
         use_forwarder: false,
         forwarder_host: String::new(),
@@ -316,17 +317,14 @@ fn publish_and_rollback_e2e() {
     .expect("download v1");
     assert_eq!(std::fs::read(&dl1).unwrap(), v1, "after publish should be v1");
 
-    // 列出备份版本
-    client.ls("/backup");
+    // 列出备份版本（备份库在 service 私有工作目录 meta 下，走专用 Backups 指令）
+    client.list_backups();
     let ev = wait_for(&client, Duration::from_secs(10), |e| {
-        matches!(e, Event::DirListed { .. })
+        matches!(e, Event::BackupVersions { .. })
     })
     .expect("backup listed");
     let version = match ev {
-        Event::DirListed { entries, .. } => entries
-            .iter()
-            .find(|e| e.is_dir)
-            .map(|e| e.name.clone()),
+        Event::BackupVersions { versions } => versions.first().cloned(),
         _ => None,
     }
     .expect("should have a backup version");
@@ -590,6 +588,7 @@ fn start_registered_service(
         key_path: certs_dir().join("server.key"),
         db_path: db.to_path_buf(),
         scripts_dir: scripts.to_path_buf(),
+        meta_dir: db.with_extension("meta"),
         web_listen: None,
         use_forwarder: true,
         forwarder_host: "localhost".into(),

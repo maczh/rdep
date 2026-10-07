@@ -39,8 +39,9 @@ async fn main() -> Result<()> {
         root_dir: root.clone(),
         cert_path: certs_dir.join("server.crt"),
         key_path: certs_dir.join("server.key"),
-        db_path: db,
+        db_path: db.clone(),
         scripts_dir: cwd.join("target/selftest-scripts"),
+        meta_dir: db.with_extension("meta"),
         web_listen: None,
         use_forwarder: false,
         forwarder_host: String::new(),
@@ -54,11 +55,27 @@ async fn main() -> Result<()> {
     };
 
     // 启动服务（后台任务，进程退出即停）
+    // 注意：错误不能吞——否则只会在 600ms 后看到一句莫名其妙的 "Connection refused"。
     tokio::spawn(async move {
-        let _ = run_service(config).await;
+        if let Err(e) = run_service(config).await {
+            eprintln!("selftest: service failed to start: {e:#}");
+        }
     });
-    // 等待监听就绪
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    // 等待监听就绪：轮询而非固定 sleep（首次构建/冷启动较慢时，600ms 会误报 Connection refused）
+    let mut ready = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(ADDR).await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if !ready {
+        anyhow::bail!(
+            "service did not accept connections on {ADDR} within 10s \
+             (see `selftest: service failed to start:` above, if any)"
+        );
+    }
 
     let (mut codec, _conn) = connect().await?;
     let mut seq: u32 = 0;
