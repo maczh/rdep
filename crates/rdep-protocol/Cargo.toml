@@ -1,0 +1,15 @@
+[package]
+name = "rdep-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "rdep 私有协议：帧编解码、压缩/编码管线、指令与分片传输定义（三端共用）"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+zstd = "0.13"
+sha2 = "0.10"
+base64 = "0.22"
+thiserror = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["io-util"] }

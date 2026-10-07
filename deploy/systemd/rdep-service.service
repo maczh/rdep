@@ -1,0 +1,54 @@
+[Unit]
+Description=rdep Service (文件发布服务)
+Documentation=https://github.com/maczh/rdep
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rdep
+Group=rdep
+# ---- 监听与数据 ----
+Environment=RDEP_LISTEN=0.0.0.0:8443
+Environment=RDEP_ROOT=/var/lib/rdep/root
+Environment=RDEP_DB=/var/lib/rdep/rdep.db
+Environment=RDEP_SCRIPTS=/var/lib/rdep/scripts
+Environment=RDEP_BACKUP_KEEP=10
+# ---- TLS 证书 ----
+Environment=RDEP_CERT=/etc/rdep/certs/server.crt
+Environment=RDEP_KEY=/etc/rdep/certs/server.key
+# ---- Web 管理后台（默认只监听本机；需要远程访问请改成 0.0.0.0:8080 并自行加反向代理/防火墙）----
+Environment=RDEP_WEB_LISTEN=127.0.0.1:8080
+# ---- 如需经 forwarder 中转，取消下面注释并填写 ----
+#Environment=RDEP_USE_FORWARDER=1
+#Environment=RDEP_FWD_HOST=forwarder.example.com
+#Environment=RDEP_FWD_PORT=9444
+#Environment=RDEP_FWD_CA=/etc/rdep/certs/forwarder.crt
+#Environment=RDEP_RELAY_TOKEN=change-me
+#Environment=RDEP_SERVICE_ID=svc-web-01
+#Environment=RDEP_SERVICE_LABEL=prod-web
+
+ExecStart=/usr/local/bin/rdep-service
+Restart=always
+RestartSec=5
+# 优雅停机：给在途会话一点时间
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# ---- 安全加固 ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+# 唯一可写目录
+ReadWritePaths=/var/lib/rdep
+
+[Install]
+WantedBy=multi-user.target

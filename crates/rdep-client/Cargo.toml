@@ -1,0 +1,58 @@
+[package]
+name = "rdep-client"
+version = "0.1.0"
+edition = "2021"
+description = "rdep 客户端：仿 FileZilla 的 GUI（站点管理 / 双栏文件树 / 传输列表 / 发布回滚 / tail / 编辑）"
+
+[lib]
+name = "rdep_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rdep-client"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+gui = ["dep:egui", "dep:eframe"]
+
+[dependencies]
+rdep-protocol = { path = "../rdep-protocol" }
+
+# SFTP 备用协议（站点可选 sftp）。russh 纯 Rust SSH 栈，用 ring（与 tokio-rustls 的
+# ring 特性一致，避免 aws-lc-rs CryptoProvider 冲突）；不启用 rsa/flate2 以精简依赖。
+russh = { version = "0.64", default-features = false, features = ["ring"] }
+russh-sftp = "3"
+
+# FTP 备用协议（站点可选 ftp）。SFTP 需要 SSH 栈，暂未接入。
+# suppaftp 的异步实现基于 async-std（其 DataStream 实现 async_std::io::Read/Write），
+# 因此 ftp.rs 用独立的 async-std runtime，与 client.rs 的 tokio 并存。
+#
+# 只启用 "async"（明文 FTP，不启用 FTPS）：suppaftp 的 rustls 特性会拉入
+# futures-rustls，其默认特性开启 aws-lc-rs，与 tokio-rustls 的 aws_lc_rs 冲突，
+# 导致 rustls 无法确定进程级 CryptoProvider（所有 TLS 连接 panic）。
+suppaftp = { version = "6", default-features = false, features = ["async"] }
+async-std = { version = "1", features = ["attributes"] }
+
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+postcard = "1"
+serde = "1"
+serde_json = "1"
+anyhow = "1"
+sha2 = "0.10"
+# 结构化 debug 日志：协议层每条指令/事件/应答都输出，可用 RUST_LOG 调级别；
+# GUI 模式下同时写入日志文件（见 logging.rs），便于排查「点了没反应」类问题。
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"
+
+egui = { version = "0.29", optional = true }
+eframe = { version = "0.29", optional = true }
+
+[dev-dependencies]
+rdep-service = { path = "../rdep-service" }
+rdep-forwarder = { path = "../rdep-forwarder" }

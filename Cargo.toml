@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rdep-protocol",
+    "crates/rdep-service",
+    "crates/rdep-forwarder",
+    "crates/rdep-client",
+]
+
+# 后续阶段逐步加入：
+#   crates/rdep-common
+#   crates/rdep-client
+#   crates/rdep-service
+#   crates/rdep-forwarder

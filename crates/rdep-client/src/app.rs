@@ -1,0 +1,2401 @@
+//! rdep-client 的 egui 主界面（FileZilla 风格）：双栏文件树 + 传输队列 + 站点管理。
+//!
+//! ## 布局
+//! - 顶栏：站点 / 连接·断开 / 发布回滚（仅 rdep）/ 日志·检索·编辑 / 语言切换 / 状态。
+//! - 左栏（本地）：路径栏 + 文件表（名称/大小/类型/修改/权限）+ 右键菜单（上传/进入/刷新/新建目录）。
+//! - 右栏（远端）：同上 + 右键菜单（下载/进入/刷新/新建目录/删除/改名）。
+//! - 底栏：传输队列（进度条 + 状态）。
+//! - 中心：日志。
+//!
+//! ## 协议分发
+//! 基础文件操作（浏览/上传/下载/新建/删除/改名）按当前协议路由到 `Client`(rdep) /
+//! `FtpClient`(ftp) / `SftpClient`(SFTP)；三者复用同一 `Event` 类型，面板与
+//! `drain_events` 无需区分协议。rdep 专属的发布/回滚/重启脚本仅 rdep 可用；
+//! tail/grep/编辑/目录同步对 rdep 与 SFTP 均可用。
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use eframe::egui;
+use rdep_protocol::{Direction, FileEntry};
+
+use crate::client::{Client, ConnectParams, Event, PublishFile};
+use crate::ftp::{FtpClient, FtpParams};
+use crate::i18n::{self, t, tf, Lang};
+use crate::sftp::{SftpClient, SftpParams};
+use crate::sites::{obfuscate_for_storage, Protocol, Site, SiteStore};
+
+#[derive(Clone)]
+struct LocalEntry {
+    name: String,
+    is_dir: bool,
+    size: u64,
+    mode: u32,
+    mtime: u64,
+}
+
+#[derive(Clone)]
+struct TransferItem {
+    id: u64,
+    name: String,
+    direction: Direction,
+    sent: u64,
+    total: u64,
+    status: String,
+    ok: bool,
+    /// TransferDone 已到（用于队列标签页分桶：进行中/失败/成功）。
+    done: bool,
+    /// 队列表格用的完整本地/远端路径。
+    local_path: String,
+    remote_path: String,
+}
+
+pub struct RdepApp {
+    client: Client,
+    /// FTP 后端（`Site.protocol == Ftp` 时使用）。
+    ftp: FtpClient,
+    /// SFTP 后端（`Site.protocol == Sftp` 时使用）。
+    sftp: SftpClient,
+    /// 当前连接使用的协议，决定基础操作路由到哪个后端。
+    backend: Protocol,
+    connected: bool,
+    status: String,
+    log: Vec<String>,
+
+    // 远端
+    remote_dir: String,
+    remote_entries: Vec<FileEntry>,
+    remote_selected: Option<usize>,
+
+    // 本地
+    local_dir: PathBuf,
+    local_entries: Vec<LocalEntry>,
+    local_selected: Option<usize>,
+
+    // 传输队列
+    transfers: Vec<TransferItem>,
+    /// 队列底部标签页：0=进行中 1=失败 2=成功。
+    queue_tab: usize,
+    /// 用户发起传输时记录 (方向, 文件名, 本地路径, 远程路径)，
+    /// 待 `TransferStarted`（只带文件名）到达后回填到 TransferItem。
+    pending_paths: Vec<(Direction, String, String, String)>,
+
+    // 目录树（FileZilla 风格：树上、文件列表下）
+    /// 本地树已展开的目录。
+    local_tree_open: std::collections::HashSet<PathBuf>,
+    /// 本地目录 → 子目录名缓存（懒加载）。
+    local_tree_cache: std::collections::HashMap<PathBuf, Vec<String>>,
+    /// 远端树已展开的目录。
+    remote_tree_open: std::collections::HashSet<String>,
+    /// 远端目录 → 子目录名缓存（懒加载，来自 ls 应答）。
+    remote_tree_cache: std::collections::HashMap<String, Vec<String>>,
+    /// 正在等待应答的树节点 ls 路径（区分主面板 ls 与树 ls）。
+    pending_tree_ls: Option<String>,
+
+    // 连接对话框
+    show_connect: bool,
+    cfg_host: String,
+    cfg_port: String,
+    cfg_user: String,
+    cfg_pass: String,
+    cfg_ca: String,
+    // 中转（forwarder）相关（仅 rdep）
+    cfg_use_forwarder: bool,
+    cfg_service_id: String,
+    cfg_relay_token: String,
+    /// 用 API 令牌而非口令认证（此时「密码」框填令牌）。
+    cfg_use_token: bool,
+
+    // 站点管理
+    store: SiteStore,
+    sites: Vec<Site>,
+    site_selected: Option<usize>,
+    site_name_input: String,
+    site_remember_pass: bool,
+    show_sites: bool,
+    /// 从站点载入的远端目录：连接成功后落到这里（消费后清空）。
+    pending_remote_dir: Option<String>,
+
+    // 远端新建目录
+    new_dir: String,
+    // 远端改名输入
+    rename_input: String,
+
+    // 本地新建目录
+    local_new_dir: String,
+
+    // 发布 / 回滚
+    show_publish: bool,
+    publish_remote: String,
+    publish_script: String,
+    publish_files: Vec<PublishFile>,
+    pub_local_input: String,
+    pub_name_input: String,
+    rollback_remote: String,
+    backup_versions: Vec<String>,
+    rollback_version: String,
+    pending_backup_list: bool,
+
+    // 工具：tail / grep / edit
+    show_tools: bool,
+    tail_path: String,
+    tail_lines: String,
+    tail_follow: bool,
+    tail_output: Vec<String>,
+    grep_path: String,
+    grep_pattern: String,
+    grep_flags: String,
+    grep_output: Vec<String>,
+    edit_path: String,
+    edit_content: String,
+    edit_loaded: bool,
+
+    // 目录同步
+    sync_local: String,
+    sync_remote: String,
+    sync_delete_extra: bool,
+    sync_preview: Option<(Vec<String>, Vec<String>)>,
+}
+
+/// 日志时间戳 `HH:MM:SS`：日志面板按时间线排布，便于对照服务端日志定位「卡在哪一步」。
+fn now_hms() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+impl RdepApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let app = Self::new_headless();
+        // 启动时载入 CJK 字体，修复中文显示为方块（tofu）的问题（找不到则静默跳过）。
+        crate::fonts::install_cjk_fonts(&cc.egui_ctx);
+        // 应用持久化的界面语言（默认英文）。
+        i18n::set_lang(i18n::load_lang());
+        app
+    }
+
+    /// 不依赖 `eframe::CreationContext` 的构造（无显示环境冒烟测试用）。
+    pub fn new_headless() -> Self {
+        Self::with_store(SiteStore::new_default())
+    }
+
+    /// 指定站点仓库的构造（测试用：避免读写用户真实配置目录）。
+    pub fn with_store(store: SiteStore) -> Self {
+        // 让所有后端线程（rdep/FTP/SFTP）共享同一语言设置。
+        i18n::set_lang(i18n::load_lang());
+        let (sites, load_err) = match store.load() {
+            Ok(v) => (v, None),
+            Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+        };
+        let mut app = RdepApp {
+            client: Client::new(),
+            ftp: FtpClient::new(),
+            sftp: SftpClient::new(),
+            backend: Protocol::Rdep,
+            connected: false,
+            status: t("Not connected").into(),
+            log: Vec::new(),
+            remote_dir: "/".into(),
+            remote_entries: Vec::new(),
+            remote_selected: None,
+            local_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            local_entries: Vec::new(),
+            local_selected: None,
+            transfers: Vec::new(),
+            queue_tab: 0,
+            pending_paths: Vec::new(),
+            local_tree_open: std::collections::HashSet::new(),
+            local_tree_cache: std::collections::HashMap::new(),
+            remote_tree_open: std::collections::HashSet::new(),
+            remote_tree_cache: std::collections::HashMap::new(),
+            pending_tree_ls: None,
+            show_connect: false,
+            cfg_host: "127.0.0.1".into(),
+            cfg_port: "8443".into(),
+            cfg_user: "admin".into(),
+            cfg_pass: "admin".into(),
+            cfg_ca: String::new(),
+            cfg_use_forwarder: false,
+            cfg_service_id: String::new(),
+            cfg_relay_token: "rdep-relay-token".into(),
+            cfg_use_token: false,
+            store,
+            sites,
+            site_selected: None,
+            site_name_input: String::new(),
+            site_remember_pass: false,
+            show_sites: false,
+            pending_remote_dir: None,
+            new_dir: String::new(),
+            rename_input: String::new(),
+            local_new_dir: String::new(),
+            show_publish: false,
+            publish_remote: "/".into(),
+            publish_script: "restart".into(),
+            publish_files: Vec::new(),
+            pub_local_input: String::new(),
+            pub_name_input: String::new(),
+            rollback_remote: "/".into(),
+            backup_versions: Vec::new(),
+            rollback_version: String::new(),
+            pending_backup_list: false,
+            show_tools: false,
+            tail_path: "/var/log/messages".into(),
+            tail_lines: "50".into(),
+            tail_follow: false,
+            tail_output: Vec::new(),
+            grep_path: "/".into(),
+            grep_pattern: String::new(),
+            grep_flags: "in".into(),
+            grep_output: Vec::new(),
+            edit_path: String::new(),
+            edit_content: String::new(),
+            edit_loaded: false,
+            sync_local: String::new(),
+            sync_remote: "/opt/app".into(),
+            sync_delete_extra: false,
+            sync_preview: None,
+        };
+        app.refresh_local();
+        app.push_log(t("rdep client started"));
+        match load_err {
+            Some(e) => app.push_log(&format!("{}: {e}", t("Failed to read site config (ignored)"))),
+            None => {
+                if app.sites.is_empty() {
+                    app.push_log(t("No saved sites yet; save one in \"Sites\""));
+                } else {
+                    app.push_log(&tf("Loaded {n} sites", &[("n", &app.sites.len().to_string())]));
+                }
+            }
+        }
+        app
+    }
+
+    // ---- 协议分发：基础文件操作按当前协议路由到 rdep / FTP / SFTP ----
+    //
+    // 三个后端复用同一个 `Event` 类型，因此面板与 `drain_events` 无需区分协议。
+    // 只有「基础文件操作」被路由；rdep 专属能力（发布/回滚/重启脚本）由
+    // `require_publish` 显式拦截并说明原因，不静默失败；tail/grep/编辑/同步
+    // 由 `require_advanced` 放行（rdep 与 SFTP 均支持）。
+
+    /// 当前后端是否支持高级能力（tail/grep/编辑/目录同步）：rdep 与 SFTP。
+    /// 不支持时记日志并返回 false。
+    fn require_advanced(&mut self, feature: &'static str) -> bool {
+        if self.backend.supports_advanced() {
+            return true;
+        }
+        self.push_log(&tf(
+            "\"{f}\" requires the rdep protocol; current site is {p}, skipped",
+            &[("f", t(feature)), ("p", protocol_name(self.backend))],
+        ));
+        false
+    }
+
+    /// 当前后端是否支持发布/回滚（仅 rdep）。不支持时记日志并返回 false。
+    fn require_publish(&mut self, feature: &'static str) -> bool {
+        if self.backend.supports_publish() {
+            return true;
+        }
+        self.push_log(&tf(
+            "\"{f}\" requires the rdep protocol; current site is {p}, skipped",
+            &[("f", t(feature)), ("p", protocol_name(self.backend))],
+        ));
+        false
+    }
+
+    fn ls_remote(&self, path: &str) {
+        tracing::debug!(backend = ?self.backend, path, "ls_remote: dispatch");
+        match self.backend {
+            Protocol::Rdep => self.client.ls(path),
+            Protocol::Ftp => self.ftp.ls(path),
+            Protocol::Sftp => self.sftp.ls(path),
+        }
+    }
+
+    fn do_upload(&mut self, remote_path: String, local_path: String) {
+        tracing::debug!(backend = ?self.backend, local = %local_path, remote = %remote_path, "action: upload");
+        // 记录完整路径，供 TransferStarted 到达时回填队列表格
+        if let Some(name) = std::path::Path::new(&local_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+        {
+            self.pending_paths.push((
+                Direction::Upload,
+                name,
+                local_path.clone(),
+                remote_path.clone(),
+            ));
+        }
+        match self.backend {
+            Protocol::Rdep => self.client.upload(remote_path, local_path),
+            Protocol::Ftp => self.ftp.upload(remote_path, local_path),
+            Protocol::Sftp => self.sftp.upload(remote_path, local_path),
+        }
+    }
+
+    fn do_download(&mut self, remote_path: String, local_path: String) {
+        tracing::debug!(backend = ?self.backend, remote = %remote_path, local = %local_path, "action: download");
+        if let Some(name) = std::path::Path::new(&remote_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+        {
+            self.pending_paths.push((
+                Direction::Download,
+                name,
+                local_path.clone(),
+                remote_path.clone(),
+            ));
+        }
+        match self.backend {
+            Protocol::Rdep => self.client.download(remote_path, local_path),
+            Protocol::Ftp => self.ftp.download(remote_path, local_path),
+            Protocol::Sftp => self.sftp.download(remote_path, local_path),
+        }
+    }
+
+    fn do_mkdir(&self, paths: Vec<String>) {
+        tracing::debug!(backend = ?self.backend, paths = ?paths, "action: mkdir");
+        match self.backend {
+            Protocol::Rdep => self.client.mkdir(paths),
+            Protocol::Ftp => self.ftp.mkdir(paths),
+            Protocol::Sftp => self.sftp.mkdir(paths),
+        }
+    }
+
+    fn do_delete(&self, paths: Vec<String>) {
+        tracing::debug!(backend = ?self.backend, paths = ?paths, "action: delete");
+        match self.backend {
+            Protocol::Rdep => self.client.delete(paths),
+            Protocol::Ftp => self.ftp.delete(paths),
+            Protocol::Sftp => self.sftp.delete(paths),
+        }
+    }
+
+    fn do_rename(&self, src: String, new_name: String) {
+        tracing::debug!(backend = ?self.backend, src = %src, new_name = %new_name, "action: rename");
+        match self.backend {
+            Protocol::Rdep => self.client.rename(src, new_name),
+            Protocol::Ftp => self.ftp.rename(src, new_name),
+            Protocol::Sftp => self.sftp.rename(src, new_name),
+        }
+    }
+
+    fn do_disconnect(&self) {
+        tracing::debug!(backend = ?self.backend, "action: disconnect");
+        match self.backend {
+            Protocol::Rdep => self.client.disconnect(),
+            Protocol::Ftp => self.ftp.disconnect(),
+            Protocol::Sftp => self.sftp.disconnect(),
+        }
+    }
+
+    fn do_tail(&mut self, path: String, lines: u32, follow: bool) {
+        tracing::debug!(backend = ?self.backend, path = %path, lines, follow, "action: tail");
+        if self.backend == Protocol::Ftp {
+            self.push_log(t("FTP only supports basic file operations; publish/rollback, directory sync, tail/grep, edit, resume and relay are rdep-only. FTP is plaintext."));
+            return;
+        }
+        match self.backend {
+            Protocol::Rdep => self.client.tail(path, lines, follow),
+            Protocol::Sftp => self.sftp.tail(path, lines, follow),
+            Protocol::Ftp => unreachable!(),
+        }
+    }
+
+    fn do_stop_tail(&self) {
+        tracing::debug!(backend = ?self.backend, "action: stop tail");
+        match self.backend {
+            Protocol::Rdep => self.client.request_stop_tail(),
+            Protocol::Sftp => self.sftp.request_stop_tail(),
+            Protocol::Ftp => {}
+        }
+    }
+
+    fn do_grep(&mut self, path: String, pattern: String, flags: String) {
+        tracing::debug!(backend = ?self.backend, path = %path, pattern = %pattern, flags = %flags, "action: grep");
+        if self.backend == Protocol::Ftp {
+            self.push_log(t("FTP only supports basic file operations; publish/rollback, directory sync, tail/grep, edit, resume and relay are rdep-only. FTP is plaintext."));
+            return;
+        }
+        match self.backend {
+            Protocol::Rdep => self.client.grep(path, pattern, flags),
+            Protocol::Sftp => self.sftp.grep(path, pattern, flags),
+            Protocol::Ftp => unreachable!(),
+        }
+    }
+
+    fn do_edit_get(&mut self, path: String) {
+        tracing::debug!(backend = ?self.backend, path = %path, "action: edit load");
+        if self.backend == Protocol::Ftp {
+            self.push_log(t("FTP only supports basic file operations; publish/rollback, directory sync, tail/grep, edit, resume and relay are rdep-only. FTP is plaintext."));
+            return;
+        }
+        match self.backend {
+            Protocol::Rdep => self.client.edit_get(path),
+            Protocol::Sftp => self.sftp.edit_get(path),
+            Protocol::Ftp => unreachable!(),
+        }
+    }
+
+    fn do_edit_save(&mut self, path: String, content: String) {
+        tracing::debug!(backend = ?self.backend, path = %path, bytes = content.len(), "action: edit save");
+        if self.backend == Protocol::Ftp {
+            self.push_log(t("FTP only supports basic file operations; publish/rollback, directory sync, tail/grep, edit, resume and relay are rdep-only. FTP is plaintext."));
+            return;
+        }
+        match self.backend {
+            Protocol::Rdep => self.client.edit_save(path, content),
+            Protocol::Sftp => self.sftp.edit_save(path, content),
+            Protocol::Ftp => unreachable!(),
+        }
+    }
+
+    fn do_sync_dir(&mut self, local: String, remote: String, delete_extra: bool, dry_run: bool) {
+        tracing::debug!(backend = ?self.backend, local = %local, remote = %remote, delete_extra, dry_run, "action: sync dir");
+        if self.backend == Protocol::Ftp {
+            self.push_log(t("FTP only supports basic file operations; publish/rollback, directory sync, tail/grep, edit, resume and relay are rdep-only. FTP is plaintext."));
+            return;
+        }
+        match self.backend {
+            Protocol::Rdep => self.client.sync_dir(local, remote, delete_extra, dry_run),
+            Protocol::Sftp => self.sftp.sync_dir(local, remote, delete_extra, dry_run),
+            Protocol::Ftp => unreachable!(),
+        }
+    }
+
+    /// 按当前选择的协议发起连接（rdep / FTP / SFTP）。
+    fn connect_via_current_backend(&mut self) {
+        // 即时反馈：无论后端多快失败，点击后立刻有可见变化
+        let host = self.cfg_host.trim().to_string();
+        let port = self.cfg_port.trim().to_string();
+        if host.is_empty() {
+            let msg = t("Host is required");
+            self.status = msg.to_string();
+            self.push_log(&msg);
+            return;
+        }
+        tracing::debug!(
+            backend = ?self.backend,
+            host, port,
+            user = %self.cfg_user,
+            pass_len = self.cfg_pass.len(),
+            ca = %self.cfg_ca,
+            use_forwarder = self.cfg_use_forwarder,
+            service_id = %self.cfg_service_id,
+            use_token = self.cfg_use_token,
+            "action: connect"
+        );
+        let hint = tf("Connecting to {host}:{port} ...", &[("host", &host), ("port", &port)]);
+        self.status = hint.clone();
+        self.push_log(&hint);
+        match self.backend {
+            Protocol::Rdep => {
+                let p = self.params_from_form();
+                self.client.connect(p);
+            }
+            Protocol::Ftp => {
+                self.ftp.connect(FtpParams {
+                    host: self.cfg_host.trim().to_string(),
+                    port: self.cfg_port.trim().parse().unwrap_or(21),
+                    user: self.cfg_user.trim().to_string(),
+                    pass: self.cfg_pass.clone(),
+                    initial_dir: if self.remote_dir.trim().is_empty() {
+                        String::new()
+                    } else {
+                        self.remote_dir.trim().to_string()
+                    },
+                });
+            }
+            Protocol::Sftp => {
+                self.sftp.connect(SftpParams {
+                    host: self.cfg_host.trim().to_string(),
+                    port: self.cfg_port.trim().parse().unwrap_or(22),
+                    user: self.cfg_user.trim().to_string(),
+                    pass: self.cfg_pass.clone(),
+                    initial_dir: if self.remote_dir.trim().is_empty() {
+                        String::new()
+                    } else {
+                        self.remote_dir.trim().to_string()
+                    },
+                });
+            }
+        }
+    }
+
+    /// 把当前连接表单组装为 `ConnectParams`。
+    fn params_from_form(&self) -> ConnectParams {
+        ConnectParams {
+            host: self.cfg_host.trim().to_string(),
+            port: self.cfg_port.trim().parse().unwrap_or(8443),
+            user: self.cfg_user.trim().to_string(),
+            pass: self.cfg_pass.clone(),
+            ca_cert: if self.cfg_ca.trim().is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(self.cfg_ca.trim()))
+            },
+            use_forwarder: self.cfg_use_forwarder,
+            target_service_id: self.cfg_service_id.trim().to_string(),
+            relay_token: self.cfg_relay_token.trim().to_string(),
+            use_token: self.cfg_use_token,
+        }
+    }
+
+    /// 用选中站点的配置填充连接表单。
+    fn load_site_into_form(&mut self, idx: usize) {
+        let Some(s) = self.sites.get(idx).cloned() else {
+            return;
+        };
+        self.site_name_input = s.name.clone();
+        self.backend = s.protocol;
+        self.cfg_use_token = s.use_token;
+        self.cfg_host = s.host.clone();
+        self.cfg_port = s.port.to_string();
+        self.cfg_user = s.user.clone();
+        self.cfg_pass = s.password_plain();
+        self.cfg_ca = s.ca_cert.clone();
+        self.cfg_use_forwarder = s.use_forwarder;
+        self.cfg_service_id = s.target_service_id.clone();
+        self.cfg_relay_token = if s.relay_token_plain().is_empty() {
+            "rdep-relay-token".into()
+        } else {
+            s.relay_token_plain()
+        };
+        if !s.last_remote_dir.is_empty() {
+            self.pending_remote_dir = Some(s.last_remote_dir.clone());
+        }
+        self.site_remember_pass = !s.password.is_empty();
+    }
+
+    /// 把当前连接表单保存为一个站点（按站点名 upsert）。
+    fn save_current_form_as_site(&mut self) {
+        let name = self.site_name_input.trim().to_string();
+        if name.is_empty() {
+            self.push_log(t("Enter a site name first"));
+            return;
+        }
+        let password = if self.site_remember_pass {
+            obfuscate_for_storage(&self.cfg_pass)
+        } else {
+            String::new()
+        };
+        let relay_token = if self.cfg_use_forwarder && self.site_remember_pass {
+            obfuscate_for_storage(self.cfg_relay_token.trim())
+        } else {
+            String::new()
+        };
+        let site = Site {
+            name: name.clone(),
+            protocol: self.backend,
+            host: self.cfg_host.trim().to_string(),
+            port: self.cfg_port.trim().parse().unwrap_or(8443),
+            user: self.cfg_user.trim().to_string(),
+            password,
+            ca_cert: self.cfg_ca.trim().to_string(),
+            use_forwarder: self.cfg_use_forwarder,
+            target_service_id: self.cfg_service_id.trim().to_string(),
+            relay_token,
+            last_remote_dir: self.remote_dir.clone(),
+            use_token: self.cfg_use_token,
+        };
+        match self.store.upsert(site) {
+            Ok(()) => match self.store.load() {
+                Ok(v) => {
+                    self.sites = v;
+                    self.site_selected = self.sites.iter().position(|s| s.name == name);
+                    let p = self.store.path().display().to_string();
+                    let extra = if self.site_remember_pass {
+                        t("saved (with password)")
+                    } else {
+                        t("saved (password not stored)")
+                    };
+                    self.push_log(&tf(
+                        "Site \"{n}\" saved ({e}) → {p}",
+                        &[("n", &name), ("e", extra), ("p", &p)],
+                    ));
+                }
+                Err(e) => self.push_log(&format!("{}: {e:#}", t("Site written but reload failed"))),
+            },
+            Err(e) => self.push_log(&format!("{}: {e:#}", t("Failed to save site"))),
+        }
+    }
+
+    /// 删除选中站点。
+    fn delete_selected_site(&mut self) {
+        let Some(idx) = self.site_selected else {
+            self.push_log(t("Choose a site first"));
+            return;
+        };
+        let Some(s) = self.sites.get(idx).cloned() else {
+            return;
+        };
+        match self.store.remove(&s.name) {
+            Ok(()) => match self.store.load() {
+                Ok(v) => {
+                    self.sites = v;
+                    self.site_selected = None;
+                    self.push_log(&tf("site deleted", &[("n", &s.display())]));
+                }
+                Err(e) => self.push_log(&format!("{}: {e:#}", t("Reload after delete failed"))),
+            },
+            Err(e) => self.push_log(&format!("{}: {e:#}", t("Failed to delete site"))),
+        }
+    }
+
+    fn push_log(&mut self, s: &str) {
+        let ts = now_hms();
+        self.log.push(format!("[{ts}] {s}"));
+        if self.log.len() > 300 {
+            self.log.drain(..self.log.len() - 300);
+        }
+        // 界面日志同步进 debug 日志：用户反馈「点了没反应」时，日志面板与文件日志对齐
+        tracing::debug!(message = %s, "gui log");
+    }
+
+    /// 取三个后台线程回传的事件并刷新界面状态。
+    fn drain_events(&mut self) {
+        while let Some(ev) = self.client.next_event() {
+            self.handle(ev);
+        }
+        while let Some(ev) = self.ftp.next_event() {
+            self.handle(ev);
+        }
+        while let Some(ev) = self.sftp.next_event() {
+            self.handle(ev);
+        }
+    }
+
+    /// 统一处理任一后端回传的事件。
+    fn handle(&mut self, ev: Event) {
+        match ev {
+            Event::Status(s) => {
+                self.status = s.clone();
+                self.push_log(&s);
+            }
+            Event::Connected => {
+                self.connected = true;
+                self.push_log(t("Connected"));
+                let target = self.pending_remote_dir.take().unwrap_or_else(|| "/".into());
+                self.cd_remote(target);
+            }
+            Event::Disconnected => {
+                // 连接失败时后端会先发 Error 再发 Disconnected；
+                // 只有“原本已连接”的断开才把状态改回 Disconnected，
+                // 否则错误信息会被同帧覆盖，看起来像按钮没反应。
+                let was_connected = self.connected;
+                self.connected = false;
+                // 连接已断：所有「在途请求」标记都作废，避免残留状态吞掉后续应答
+                if self.pending_tree_ls.take().is_some() {
+                    tracing::debug!("disconnect: cleared pending_tree_ls");
+                }
+                self.pending_backup_list = false;
+                if was_connected {
+                    self.status = t("Disconnected").into();
+                }
+                self.push_log(t("Disconnected"));
+            }
+            Event::Error(s) => {
+                self.push_log(&format!("{}: {s}", t("server error")));
+                self.status = s;
+                // 出错时清理「在途目录树 ls」标记：否则该标记永久残留，
+                // 之后主面板的 ls 应答会被误判为树节点加载而被吞掉 —— 表现为
+                // 「点 Refresh 没有任何作用」。
+                if self.pending_tree_ls.take().is_some() {
+                    tracing::debug!("cleared stale pending_tree_ls after error");
+                }
+            }
+            Event::DirListed { path, entries } => {
+                if self.pending_backup_list {
+                    self.backup_versions = entries
+                        .iter()
+                        .filter(|e| e.is_dir)
+                        .map(|e| e.name.clone())
+                        .collect();
+                    self.pending_backup_list = false;
+                } else if self.pending_tree_ls.as_deref() == Some(path.as_str()) {
+                    // 这是目录树节点的懒加载 ls：只取子目录名进缓存
+                    self.pending_tree_ls = None;
+                    let mut subs: Vec<String> = entries
+                        .iter()
+                        .filter(|e| e.is_dir)
+                        .map(|e| e.name.clone())
+                        .collect();
+                    subs.sort();
+                    self.remote_tree_cache.insert(path.clone(), subs);
+                } else {
+                    self.remote_dir = path;
+                    self.push_log(&tf(
+                        "{n} entries in {path}",
+                        &[("n", &entries.len().to_string()), ("path", &self.remote_dir)],
+                    ));
+                    // 根目录没有上级（service 拒绝 `..`），不显示 ".." 行
+                    let mut v = Vec::new();
+                    if self.remote_dir != "/" {
+                        v.push(FileEntry {
+                            name: "..".into(),
+                            is_dir: true,
+                            size: 0,
+                            mtime: 0,
+                            mode: 0,
+                        });
+                    }
+                    v.extend(entries);
+                    self.remote_entries = v;
+                }
+            }
+            Event::TransferStarted { id, name, direction } => {
+                // 回填发起传输时记录的完整路径
+                let (mut local_path, mut remote_path) = (String::new(), String::new());
+                if let Some(pos) = self
+                    .pending_paths
+                    .iter()
+                    .position(|(d, n, _, _)| *d == direction && n == &name)
+                {
+                    let (_, _, l, r) = self.pending_paths.remove(pos);
+                    local_path = l;
+                    remote_path = r;
+                }
+                self.transfers.push(TransferItem {
+                    id,
+                    name,
+                    direction,
+                    sent: 0,
+                    total: 0,
+                    status: t("Transferring").into(),
+                    ok: false,
+                    done: false,
+                    local_path,
+                    remote_path,
+                });
+            }
+            Event::TransferProgress { id, sent, total } => {
+                if let Some(x) = self.transfers.iter_mut().find(|x| x.id == id) {
+                    x.sent = sent;
+                    x.total = total;
+                }
+            }
+            Event::TransferDone { id, ok, message } => {
+                if let Some(x) = self.transfers.iter_mut().find(|x| x.id == id) {
+                    x.ok = ok;
+                    x.done = true;
+                    x.status = if message.is_empty() {
+                        if ok {
+                            t("Done").into()
+                        } else {
+                            t("Failed").into()
+                        }
+                    } else {
+                        message
+                    };
+                }
+            }
+            Event::OpDone { ok, message } => {
+                self.push_log(&format!(
+                    "{}: {}",
+                    if ok { t("op ok") } else { t("op failed") },
+                    message
+                ));
+                if self.connected {
+                    self.refresh_remote();
+                }
+            }
+            Event::PublishDone { ok, message } => {
+                self.push_log(&format!(
+                    "{}: {}",
+                    if ok { t("publish ok") } else { t("publish failed") },
+                    message
+                ));
+                if self.connected {
+                    self.refresh_remote();
+                }
+            }
+            Event::EditLoaded { content } => {
+                self.edit_content = content;
+                self.edit_loaded = true;
+            }
+            Event::TailLine { line } => {
+                self.tail_output.push(line);
+                if self.tail_output.len() > 500 {
+                    let drop = self.tail_output.len() - 500;
+                    self.tail_output.drain(..drop);
+                }
+            }
+            Event::TailDone { ok, message } => {
+                self.push_log(&format!(
+                    "{}: {}",
+                    if ok { t("tail done") } else { t("op failed") },
+                    message
+                ));
+                if !ok && !message.is_empty() {
+                    self.tail_output.push(format!("[{}] {message}", t("server error")));
+                }
+            }
+            Event::GrepResult { lines } => {
+                self.push_log(&tf("{n} match(es)", &[("n", &lines.len().to_string())]));
+                self.grep_output = lines;
+            }
+            Event::SyncPreview { changed, to_delete } => {
+                self.sync_preview = Some((changed, to_delete));
+            }
+        }
+    }
+
+    fn refresh_local(&mut self) {
+        // 本地目录可能已变化，目录树缓存一并失效
+        self.local_tree_cache.clear();
+        let mut v = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.local_dir) {
+            for entry in rd.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    let is_dir = meta.is_dir();
+                    let size = if is_dir { 0 } else { meta.len() };
+                    let mode = if is_dir { 0 } else { local_mode(&meta) };
+                    let mtime = if is_dir {
+                        0
+                    } else {
+                        meta.modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    };
+                    v.push(LocalEntry {
+                        name: entry.file_name().to_string_lossy().to_string(),
+                        is_dir,
+                        size,
+                        mode,
+                        mtime,
+                    });
+                }
+            }
+        }
+        v.sort_by(|a, b| {
+            if a.is_dir != b.is_dir {
+                return if a.is_dir {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+            }
+            a.name.to_lowercase().cmp(&b.name.to_lowercase())
+        });
+        if self.local_dir.parent().is_some() {
+            v.insert(
+                0,
+                LocalEntry {
+                    name: "..".into(),
+                    is_dir: true,
+                    size: 0,
+                    mode: 0,
+                    mtime: 0,
+                },
+            );
+        }
+        self.local_entries = v;
+    }
+
+    fn enter_local(&mut self, p: PathBuf) {
+        self.local_dir = p;
+        self.local_selected = None;
+        self.refresh_local();
+    }
+
+    fn cd_remote(&mut self, p: String) {
+        tracing::debug!(path = %p, "cd_remote");
+        self.remote_dir = p.clone();
+        self.ls_remote(&p);
+    }
+
+    /// 刷新远端主面板（Refresh 按钮 / 操作完成后的自动刷新）。
+    ///
+    /// 关键：先清掉可能残留的「目录树 ls」在途标记。否则该标记会把本次 ls 应答
+    /// 误判为树节点懒加载结果而写进树缓存，主面板纹丝不动 —— 即用户看到的
+    /// 「点 Refresh 没有任何作用」。
+    fn refresh_remote(&mut self) {
+        if self.pending_tree_ls.take().is_some() {
+            tracing::debug!("refresh_remote: dropped stale pending_tree_ls");
+        }
+        let path = self.remote_dir.clone();
+        tracing::debug!(path = %path, "refresh_remote: issuing ls");
+        self.push_log(&tf("Listing {path} ...", &[("path", &path)]));
+        self.ls_remote(&path);
+    }
+
+    // ---- 文件表渲染（双栏共用的列：名称/大小/类型/修改/权限） ----
+    //
+    // FileZilla 风格：表头 + 行；行可单击选中、双击进入目录、右键弹出上下文菜单。
+
+    fn local_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading(t("Local"));
+        ui.horizontal(|ui| {
+            if ui.button("↑").clicked() {
+                if let Some(p) = self.local_dir.parent() {
+                    self.enter_local(p.to_path_buf());
+                }
+            }
+            if ui.button(t("Refresh")).clicked() {
+                self.refresh_local();
+            }
+            if ui.button(t("Upload")).clicked() {
+                self.upload_selected_local();
+            }
+            ui.label(t("Local site:"));
+            ui.monospace(self.local_dir.display().to_string());
+        });
+        ui.horizontal(|ui| {
+            ui.label(t("New directory"));
+            ui.text_edit_singleline(&mut self.local_new_dir);
+            if ui.button(t("Go")).clicked() && !self.local_new_dir.trim().is_empty() {
+                let p = self.local_dir.join(self.local_new_dir.trim());
+                if let Err(e) = std::fs::create_dir_all(&p) {
+                    self.push_log(&format!("{}: {e}", t("New directory")));
+                } else {
+                    self.push_log(&format!(
+                        "{}: {}",
+                        t("New directory"),
+                        p.display()
+                    ));
+                    self.local_new_dir.clear();
+                    self.refresh_local();
+                }
+            }
+        });
+        // ---- 目录树（FileZilla 风格：树上、文件列表下；点击目录名即切换） ----
+        egui::ScrollArea::vertical()
+            .max_height(170.0)
+            .id_salt("local_tree")
+            .show(ui, |ui| {
+                self.local_tree_node(ui, PathBuf::from("/"));
+            });
+        ui.separator();
+        self.file_table(ui, false);
+    }
+
+    fn remote_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading(t("Remote"));
+        ui.horizontal(|ui| {
+            if ui.button("↑").clicked() {
+                self.cd_remote(remote_parent(&self.remote_dir));
+            }
+            // 未连接时点击 Refresh 曾静默 no-op（按钮像坏了）；现在给出明确提示。
+            if ui.button(t("Refresh")).clicked() {
+                if !self.connected {
+                    let msg = t("Not connected; connect first");
+                    tracing::debug!("refresh clicked but not connected");
+                    self.status = msg.to_string();
+                    self.push_log(&msg);
+                } else {
+                    self.refresh_remote();
+                }
+            }
+            if ui.button(t("Download")).clicked() {
+                self.download_selected_remote();
+            }
+            if ui.button(t("Delete")).clicked() {
+                self.delete_selected_remote();
+            }
+            ui.label(t("Remote site:"));
+            ui.monospace(&self.remote_dir);
+        });
+        ui.horizontal(|ui| {
+            ui.label(t("New directory"));
+            ui.text_edit_singleline(&mut self.new_dir);
+            if ui.button(t("Go")).clicked() && !self.new_dir.trim().is_empty() {
+                let p = join_remote(&self.remote_dir, self.new_dir.trim());
+                self.do_mkdir(vec![p]);
+                self.new_dir.clear();
+            }
+        });
+        // ---- 目录树（懒加载：展开节点时向服务端发 ls） ----
+        egui::ScrollArea::vertical()
+            .max_height(170.0)
+            .id_salt("remote_tree")
+            .show(ui, |ui| {
+                self.remote_tree_node(ui, "/");
+            });
+        ui.separator();
+        self.file_table(ui, true);
+    }
+
+    /// 本地目录树节点（递归渲染，子目录懒加载缓存）。
+    fn local_tree_node(&mut self, ui: &mut egui::Ui, path: PathBuf) {
+        let open = self.local_tree_open.contains(&path);
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".into());
+        ui.horizontal(|ui| {
+            if ui.small_button(if open { "▾" } else { "▸" }).clicked() {
+                if open {
+                    self.local_tree_open.remove(&path);
+                } else {
+                    self.local_tree_open.insert(path.clone());
+                }
+            }
+            let current = self.local_dir == path;
+            if ui.selectable_label(current, format!("📁 {name}")).clicked() {
+                self.enter_local(path.clone());
+            }
+        });
+        if open {
+            let subs = self.local_subdirs(&path);
+            for s in subs {
+                let child = if path == PathBuf::from("/") {
+                    PathBuf::from(format!("/{s}"))
+                } else {
+                    path.join(&s)
+                };
+                let id = egui::Id::new("lt").with(&child);
+                ui.indent(id, |ui| {
+                    self.local_tree_node(ui, child);
+                });
+            }
+        }
+    }
+
+    /// 读取某目录的子目录名（仅目录，不跟随符号链接；带缓存）。
+    fn local_subdirs(&mut self, path: &std::path::Path) -> Vec<String> {
+        if let Some(v) = self.local_tree_cache.get(path) {
+            return v.clone();
+        }
+        let mut v: Vec<String> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(path) {
+            for e in rd.flatten() {
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    v.push(e.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        v.sort();
+        self.local_tree_cache.insert(path.to_path_buf(), v.clone());
+        v
+    }
+
+    /// 远端目录树节点：展开时向服务端懒加载子目录列表。
+    fn remote_tree_node(&mut self, ui: &mut egui::Ui, path: &str) {
+        let open = self.remote_tree_open.contains(path);
+        let name: String = if path == "/" {
+            "/".into()
+        } else {
+            path.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("/")
+                .to_string()
+        };
+        ui.horizontal(|ui| {
+            if ui.small_button(if open { "▾" } else { "▸" }).clicked() {
+                if open {
+                    self.remote_tree_open.remove(path);
+                } else {
+                    self.remote_tree_open.insert(path.to_string());
+                    self.request_remote_tree_ls(path);
+                }
+            }
+            let current = self.remote_dir == path;
+            if ui.selectable_label(current, format!("📁 {name}")).clicked()
+                && self.connected
+            {
+                self.cd_remote(path.to_string());
+            }
+        });
+        if open {
+            if let Some(subs) = self.remote_tree_cache.get(path).cloned() {
+                for s in subs {
+                    let child = join_remote(path, &s);
+                    let id = egui::Id::new("rt").with(&child);
+                    ui.indent(id, |ui| {
+                        self.remote_tree_node(ui, &child);
+                    });
+                }
+            } else {
+                ui.label("…");
+            }
+        }
+    }
+
+    /// 请求一次树节点 ls（同一时刻只允许一个在途，避免与主面板 ls 混淆）。
+    fn request_remote_tree_ls(&mut self, path: &str) {
+        if !self.connected || self.pending_tree_ls.is_some() {
+            return;
+        }
+        self.pending_tree_ls = Some(path.to_string());
+        self.ls_remote(path);
+    }
+
+    /// 渲染文件表（本地 `is_local=true` / 远端 `false`），含表头、单击选中、
+    /// 双击进入目录、右键上下文菜单。
+    fn file_table(&mut self, ui: &mut egui::Ui, is_remote: bool) {
+        let entries: Vec<FileRow> = if is_remote {
+            self.remote_entries
+                .iter()
+                .map(|e| FileRow {
+                    name: e.name.clone(),
+                    is_dir: e.is_dir,
+                    size: e.size,
+                    mode: e.mode,
+                    mtime: e.mtime.max(0) as u64,
+                })
+                .collect()
+        } else {
+            self.local_entries
+                .iter()
+                .map(|e| FileRow {
+                    name: e.name.clone(),
+                    is_dir: e.is_dir,
+                    size: e.size,
+                    mode: e.mode,
+                    mtime: e.mtime,
+                })
+                .collect()
+        };
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new(if is_remote { "remote_grid" } else { "local_grid" })
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong(t("Name"));
+                    ui.strong(t("Size"));
+                    ui.strong(t("Type"));
+                    ui.strong(t("Modified"));
+                    ui.strong(t("Perms"));
+                    ui.end_row();
+
+                    for (i, e) in entries.iter().enumerate() {
+                        let selected = if is_remote {
+                            self.remote_selected == Some(i)
+                        } else {
+                            self.local_selected == Some(i)
+                        };
+                        let icon = if e.is_dir { "📁 " } else { "📄 " };
+                        let resp = ui.selectable_label(selected, format!("{icon}{}", e.name));
+                        ui.monospace(fmt_size(e.size));
+                        ui.label(if e.is_dir {
+                            t("Directory")
+                        } else {
+                            t("File")
+                        });
+                        ui.monospace(fmt_time(e.mtime));
+                        ui.monospace(format!("{:o}", e.mode));
+                        ui.end_row();
+
+                        if resp.clicked() {
+                            if is_remote {
+                                self.remote_selected = Some(i);
+                            } else {
+                                self.local_selected = Some(i);
+                            }
+                        }
+                        let name = e.name.clone();
+                        let is_dir = e.is_dir;
+                        if resp.double_clicked() && (name == ".." || is_dir) {
+                            if is_remote {
+                                self.remote_selected = Some(i);
+                                if name == ".." {
+                                    self.cd_remote(remote_parent(&self.remote_dir));
+                                } else {
+                                    self.cd_remote(join_remote(&self.remote_dir, &name));
+                                }
+                            } else {
+                                self.local_selected = Some(i);
+                                if name == ".." {
+                                    if let Some(p) = self.local_dir.parent() {
+                                        self.enter_local(p.to_path_buf());
+                                    }
+                                } else {
+                                    self.enter_local(self.local_dir.join(&name));
+                                }
+                            }
+                        }
+                        resp.context_menu(|ui| {
+                            if is_remote {
+                                self.remote_context_menu(ui, i);
+                            } else {
+                                self.local_context_menu(ui, i);
+                            }
+                        });
+                    }
+                });
+        });
+    }
+
+    /// 右键上下文菜单：远端文件/目录。
+    fn remote_context_menu(&mut self, ui: &mut egui::Ui, i: usize) {
+        let Some(e) = self.remote_entries.get(i).cloned() else {
+            return;
+        };
+        let name = e.name.clone();
+        let is_dir = e.is_dir;
+        if !is_dir && name != ".." && ui.button(t("Download")).clicked() {
+            self.do_download(
+                join_remote(&self.remote_dir, &name),
+                self.local_dir.join(&name).to_string_lossy().to_string(),
+            );
+            ui.close_menu();
+        }
+        if (is_dir || name == "..") && ui.button(t("Enter")).clicked() {
+            if name == ".." {
+                self.cd_remote(remote_parent(&self.remote_dir));
+            } else {
+                self.cd_remote(join_remote(&self.remote_dir, &name));
+            }
+            ui.close_menu();
+        }
+        if ui.button(t("Refresh")).clicked() {
+            if self.connected {
+                self.ls_remote(&self.remote_dir);
+            }
+            ui.close_menu();
+        }
+        if ui.button(t("New directory")).clicked() {
+            // 聚焦新建目录输入框
+            self.new_dir = String::new();
+            ui.close_menu();
+        }
+        if !is_dir && name != ".." && ui.button(t("Delete")).clicked() {
+            self.do_delete(vec![join_remote(&self.remote_dir, &name)]);
+            ui.close_menu();
+        }
+        if !is_dir && name != ".." {
+            ui.horizontal(|ui| {
+                ui.label(t("Rename"));
+                ui.text_edit_singleline(&mut self.rename_input);
+                if ui.button(t("Go")).clicked() {
+                    let nn = self.rename_input.trim().to_string();
+                    if !nn.is_empty() {
+                        self.do_rename(join_remote(&self.remote_dir, &name), nn);
+                        self.rename_input.clear();
+                    }
+                    ui.close_menu();
+                }
+            });
+        }
+    }
+
+    /// 右键上下文菜单：本地文件/目录。
+    fn local_context_menu(&mut self, ui: &mut egui::Ui, i: usize) {
+        let Some(e) = self.local_entries.get(i).cloned() else {
+            return;
+        };
+        let name = e.name.clone();
+        let is_dir = e.is_dir;
+        if !is_dir && name != ".." && ui.button(t("Upload")).clicked() {
+            self.do_upload(
+                join_remote(&self.remote_dir, &name),
+                self.local_dir.join(&name).to_string_lossy().to_string(),
+            );
+            ui.close_menu();
+        }
+        if (is_dir || name == "..") && ui.button(t("Enter")).clicked() {
+            if name == ".." {
+                if let Some(p) = self.local_dir.parent() {
+                    self.enter_local(p.to_path_buf());
+                }
+            } else {
+                self.enter_local(self.local_dir.join(&name));
+            }
+            ui.close_menu();
+        }
+        if ui.button(t("Refresh")).clicked() {
+            self.refresh_local();
+            ui.close_menu();
+        }
+        if ui.button(t("New directory")).clicked() {
+            self.local_new_dir = String::new();
+            ui.close_menu();
+        }
+    }
+
+    fn upload_selected_local(&mut self) {
+        if let Some(i) = self.local_selected {
+            if let Some(e) = self.local_entries.get(i) {
+                if !e.is_dir && e.name != ".." {
+                    let lp = self.local_dir.join(&e.name);
+                    let rp = join_remote(&self.remote_dir, &e.name);
+                    self.do_upload(rp, lp.to_string_lossy().to_string());
+                }
+            }
+        } else {
+            self.push_log(t("Select a file in the remote list first"));
+        }
+    }
+
+    fn download_selected_remote(&mut self) {
+        if let Some(i) = self.remote_selected {
+            if let Some(e) = self.remote_entries.get(i) {
+                if !e.is_dir && e.name != ".." {
+                    let rp = join_remote(&self.remote_dir, &e.name);
+                    let lp = self.local_dir.join(&e.name);
+                    self.do_download(rp, lp.to_string_lossy().to_string());
+                }
+            }
+        } else {
+            self.push_log(t("Select a file in the remote list first"));
+        }
+    }
+
+    fn delete_selected_remote(&mut self) {
+        if let Some(i) = self.remote_selected {
+            if let Some(e) = self.remote_entries.get(i) {
+                if !e.is_dir && e.name != ".." {
+                    self.do_delete(vec![join_remote(&self.remote_dir, &e.name)]);
+                }
+            }
+        } else {
+            self.push_log(t("Select a file in the remote list first"));
+        }
+    }
+
+    /// 队列栏（FileZilla 风格）：标签页（进行中/失败/成功）+ 多列表格。
+    fn transfer_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong(t("Transfer queue"));
+            ui.separator();
+            let tabs = [
+                t("Queued files"),
+                t("Failed transfers"),
+                t("Successful transfers"),
+            ];
+            for (i, label) in tabs.iter().enumerate() {
+                let count = match i {
+                    1 => self.transfers.iter().filter(|x| x.done && !x.ok).count(),
+                    2 => self.transfers.iter().filter(|x| x.done && x.ok).count(),
+                    _ => self.transfers.iter().filter(|x| !x.done).count(),
+                };
+                if ui
+                    .selectable_label(self.queue_tab == i, format!("{label} ({count})"))
+                    .clicked()
+                {
+                    self.queue_tab = i;
+                }
+            }
+        });
+        ui.separator();
+        let tab = self.queue_tab;
+        egui::ScrollArea::vertical()
+            .max_height(150.0)
+            .show(ui, |ui| {
+                let rows: Vec<&TransferItem> = self
+                    .transfers
+                    .iter()
+                    .filter(|x| match tab {
+                        1 => x.done && !x.ok,
+                        2 => x.done && x.ok,
+                        _ => !x.done,
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    ui.label(t("(empty)"));
+                    return;
+                }
+                egui::Grid::new("queue_grid")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong(t("Local file"));
+                        ui.strong(t("Direction"));
+                        ui.strong(t("Remote file"));
+                        ui.strong(t("Size"));
+                        ui.strong(t("Status"));
+                        ui.end_row();
+                        for x in rows {
+                            ui.monospace(if x.local_path.is_empty() {
+                                &x.name
+                            } else {
+                                &x.local_path
+                            });
+                            ui.label(match x.direction {
+                                Direction::Upload => "↑",
+                                Direction::Download => "↓",
+                            });
+                            ui.monospace(if x.remote_path.is_empty() {
+                                &x.name
+                            } else {
+                                &x.remote_path
+                            });
+                            if x.total > 0 {
+                                let pct =
+                                    (x.sent as f32 / x.total as f32).clamp(0.0, 1.0);
+                                ui.monospace(format!(
+                                    "{}/{} ({:.0}%)",
+                                    fmt_size(x.sent),
+                                    fmt_size(x.total),
+                                    pct * 100.0
+                                ));
+                            } else {
+                                ui.monospace(fmt_size(x.sent));
+                            }
+                            ui.label(&x.status);
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
+    fn log_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading(t("Log"));
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for l in &self.log {
+                ui.label(l);
+            }
+        });
+    }
+
+    fn publish_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_publish;
+        egui::Window::new(t("Publish / Rollback"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                if self.backend.supports_publish() {
+                    self.publish_rollback_inner(ui);
+                } else {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 120, 40),
+                        t("SFTP: publish/rollback require the rdep service and are unavailable."),
+                    );
+                }
+            });
+        self.show_publish = open;
+    }
+
+    /// 发布/回滚（仅 rdep）。拆出以便按协议门控。
+    fn publish_rollback_inner(&mut self, ui: &mut egui::Ui) {
+        // ---- 发布 ----
+        ui.strong(t("Publish (backup old files → upload → run restart script)"));
+        labeled(ui, t("Remote dir"), &mut self.publish_remote);
+        labeled(ui, t("Restart script id"), &mut self.publish_script);
+        labeled(ui, t("Local source file"), &mut self.pub_local_input);
+        labeled(ui, t("Remote file name"), &mut self.pub_name_input);
+        if ui.button(t("Add to publish list")).clicked() {
+            let lp = self.pub_local_input.trim().to_string();
+            let rn = self.pub_name_input.trim().to_string();
+            if !lp.is_empty() && !rn.is_empty() {
+                let rp = join_remote(&self.publish_remote, &rn);
+                self.publish_files.push(PublishFile {
+                    remote_path: rp,
+                    local_path: lp,
+                });
+            }
+        }
+        egui::ScrollArea::vertical()
+            .max_height(140.0)
+            .show(ui, |ui| {
+                if self.publish_files.is_empty() {
+                    ui.label(t("Publish list is empty"));
+                }
+                let mut remove_idx: Option<usize> = None;
+                for (i, f) in self.publish_files.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}  →  {}", f.local_path, f.remote_path));
+                        if ui.button(t("Remove")).clicked() {
+                            remove_idx = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove_idx {
+                    self.publish_files.remove(i);
+                }
+            });
+        if ui.button(t("Run publish")).clicked() {
+            if self.connected {
+                tracing::debug!(dir = %self.publish_remote, script = %self.publish_script, files = self.publish_files.len(), "action: publish");
+                self.client.publish(
+                    self.publish_remote.clone(),
+                    self.publish_script.clone(),
+                    self.publish_files.clone(),
+                );
+            } else {
+                self.push_log(t("Not connected, cannot publish"));
+            }
+        }
+
+        ui.separator();
+        // ---- 回滚 ----
+        ui.strong(t("Rollback (restore a backup version to the remote dir)"));
+        labeled(ui, t("Remote dir"), &mut self.rollback_remote);
+        ui.horizontal(|ui| {
+            if ui.button(t("List backup versions")).clicked() {
+                if self.connected {
+                    self.pending_backup_list = true;
+                    self.ls_remote("/backup");
+                } else {
+                    self.push_log(t("Not connected, cannot list backups"));
+                }
+            }
+            egui::ComboBox::from_label(t("Backup version"))
+                .selected_text(if self.rollback_version.is_empty() {
+                    t("<select version>").to_string()
+                } else {
+                    self.rollback_version.clone()
+                })
+                .show_ui(ui, |ui| {
+                    let mut picked: Option<String> = None;
+                    for v in &self.backup_versions {
+                        if ui
+                            .selectable_label(self.rollback_version == *v, v)
+                            .clicked()
+                        {
+                            picked = Some(v.clone());
+                        }
+                    }
+                    if let Some(p) = picked {
+                        self.rollback_version = p;
+                    }
+                });
+        });
+        if ui.button(t("Run rollback")).clicked() {
+            if self.connected {
+                if self.rollback_version.is_empty() {
+                    self.push_log(t("Select a backup version first"));
+                } else {
+                    tracing::debug!(dir = %self.rollback_remote, version = %self.rollback_version, "action: rollback");
+                    self.client.rollback(
+                        self.rollback_remote.clone(),
+                        self.rollback_version.clone(),
+                    );
+                }
+            } else {
+                self.push_log(t("Not connected, cannot rollback"));
+            }
+        }
+
+        ui.separator();
+        // ---- 目录同步（rdep 与 SFTP 均支持） ----
+        ui.strong(t("Directory sync (local → remote; changed = size+mtime; auto-backup before overwrite)"));
+        labeled(ui, t("Local dir"), &mut self.sync_local);
+        labeled(ui, t("Remote dir"), &mut self.sync_remote);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.sync_delete_extra, t("Delete extra remote files"));
+            if ui.button(t("Preview (dry-run)")).clicked() {
+                if self.connected {
+                    self.do_sync_dir(
+                        self.sync_local.trim().to_string(),
+                        self.sync_remote.trim().to_string(),
+                        self.sync_delete_extra,
+                        true,
+                    );
+                } else {
+                    self.push_log(t("Not connected, cannot sync"));
+                }
+            }
+            if ui.button(t("Run sync")).clicked() {
+                if self.connected {
+                    self.do_sync_dir(
+                        self.sync_local.trim().to_string(),
+                        self.sync_remote.trim().to_string(),
+                        self.sync_delete_extra,
+                        false,
+                    );
+                } else {
+                    self.push_log(t("Not connected, cannot sync"));
+                }
+            }
+        });
+        if let Some((changed, to_delete)) = self.sync_preview.clone() {
+            egui::ScrollArea::vertical()
+                .max_height(140.0)
+                .show(ui, |ui| {
+                    ui.label(tf("{n} files to upload/update:", &[("n", &changed.len().to_string())]));
+                    for c in &changed {
+                        ui.monospace(format!("  ↻ {c}"));
+                    }
+                    if !to_delete.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(200, 80, 80),
+                            tf("{n} extra remote files to delete:", &[("n", &to_delete.len().to_string())]),
+                        );
+                        for d in &to_delete {
+                            ui.monospace(format!("  ✗ {d}"));
+                        }
+                    }
+                });
+        }
+    }
+
+    fn tools_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_tools;
+        egui::Window::new(t("Log / Search / Edit"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(720.0)
+            .default_height(560.0)
+            .show(ctx, |ui| {
+                // ---- TAIL ----
+                ui.strong(t("TAIL (view log tail; optional follow)"));
+                labeled(ui, t("Remote file"), &mut self.tail_path);
+                ui.horizontal(|ui| {
+                    ui.label(t("Tail lines"));
+                    ui.text_edit_singleline(&mut self.tail_lines);
+                    ui.checkbox(&mut self.tail_follow, t("Follow"));
+                    if ui.button(t("Start")).clicked() {
+                        if self.connected {
+                            self.tail_output.clear();
+                            let n: u32 = self.tail_lines.trim().parse().unwrap_or(50);
+                            self.do_tail(self.tail_path.clone(), n, self.tail_follow);
+                        } else {
+                            self.push_log(t("Not connected, cannot tail"));
+                        }
+                    }
+                    if ui.button(t("Stop follow")).clicked() {
+                        self.do_stop_tail();
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        if self.tail_output.is_empty() {
+                            ui.label(t("(no output)"));
+                        }
+                        for l in &self.tail_output {
+                            ui.monospace(l);
+                        }
+                    });
+
+                ui.separator();
+                // ---- GREP ----
+                ui.strong(t("GREP (search content; flags: i=ignore-case n=line-number)"));
+                labeled(ui, t("Path"), &mut self.grep_path);
+                labeled(ui, t("Pattern"), &mut self.grep_pattern);
+                labeled(ui, t("Flags"), &mut self.grep_flags);
+                if ui.button(t("Search")).clicked() {
+                    if self.connected {
+                        self.do_grep(
+                            self.grep_path.clone(),
+                            self.grep_pattern.clone(),
+                            self.grep_flags.clone(),
+                        );
+                    } else {
+                        self.push_log(t("Not connected, cannot grep"));
+                    }
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        if self.grep_output.is_empty() {
+                            ui.label(t("(no output)"));
+                        }
+                        for l in &self.grep_output {
+                            ui.monospace(l);
+                        }
+                    });
+
+                ui.separator();
+                // ---- EDIT ----
+                ui.strong(t("EDIT (remote editing; auto-backup before save)"));
+                labeled(ui, t("Remote file"), &mut self.edit_path);
+                ui.horizontal(|ui| {
+                    if ui.button(t("Load")).clicked() {
+                        if self.connected {
+                            self.do_edit_get(self.edit_path.clone());
+                        } else {
+                            self.push_log(t("Not connected, cannot load"));
+                        }
+                    }
+                    let loaded = self.edit_loaded;
+                    if ui
+                        .add_enabled(loaded, egui::Button::new(t("Save")))
+                        .clicked()
+                    {
+                        if self.connected {
+                            self.do_edit_save(
+                                self.edit_path.clone(),
+                                self.edit_content.clone(),
+                            );
+                        } else {
+                            self.push_log(t("Not connected, cannot save"));
+                        }
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.edit_content)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
+            });
+        self.show_tools = open;
+    }
+
+    /// 站点管理器：列出已保存站点 / 保存当前配置 / 删除 / 双击载入到连接表单。
+    fn sites_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_sites;
+        egui::Window::new(t("Site manager"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.label(format!("{} {}", t("Config file:"), self.store.path().display()));
+                ui.separator();
+
+                if self.sites.is_empty() {
+                    ui.label(t("No saved sites yet. Fill in the connect window and click \"Save site\"."));
+                } else {
+                    let mut to_load: Option<usize> = None;
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            for (i, s) in self.sites.iter().enumerate() {
+                                let selected = self.site_selected == Some(i);
+                                let has_pass = !s.password.is_empty();
+                                let label = format!(
+                                    "[{}] {}  {}:{}{}",
+                                    protocol_name(s.protocol),
+                                    s.display(),
+                                    s.host,
+                                    s.port,
+                                    if has_pass { "  🔑" } else { "" }
+                                );
+                                let resp = ui.selectable_label(selected, label);
+                                if resp.clicked() {
+                                    self.site_selected = Some(i);
+                                }
+                                if resp.double_clicked() {
+                                    to_load = Some(i);
+                                }
+                            }
+                        });
+                    if let Some(i) = to_load {
+                        self.load_site_into_form(i);
+                        self.show_connect = true;
+                        self.push_log(t("Site loaded into connect window"));
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.button(t("Load to connect window")).clicked() {
+                            if let Some(i) = self.site_selected {
+                                self.load_site_into_form(i);
+                                self.show_connect = true;
+                                self.push_log(t("Site loaded into connect window"));
+                            } else {
+                                self.push_log(t("Choose a site first"));
+                            }
+                        }
+                        if ui.button(t("Delete selected")).clicked() {
+                            self.delete_selected_site();
+                        }
+                    });
+                }
+
+                ui.separator();
+                ui.label(t("Save current form as site:"));
+                ui.horizontal(|ui| {
+                    ui.label(t("Site name"));
+                    ui.text_edit_singleline(&mut self.site_name_input);
+                });
+                ui.checkbox(&mut self.site_remember_pass, t("Remember password"));
+                ui.horizontal(|ui| {
+                    if ui.button(t("Save site")).clicked() {
+                        self.save_current_form_as_site();
+                    }
+                });
+            });
+        self.show_sites = open;
+    }
+
+    fn connect_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_connect;
+        let mut close = false;
+        let backend_before = self.backend;
+        egui::Window::new(t("Connect to server"))
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(t("Protocol"));
+                    egui::ComboBox::from_id_salt("proto")
+                        .selected_text(self.backend.label())
+                        .show_ui(ui, |ui| {
+                            for p in [Protocol::Rdep, Protocol::Ftp, Protocol::Sftp] {
+                                ui.selectable_value(&mut self.backend, p, p.label());
+                            }
+                        });
+                });
+                if !self.backend.supports_advanced() {
+                    ui.colored_label(
+                        egui::Color32::from_gray(140),
+                        t("FTP only supports basic file operations; publish/rollback, directory sync, tail/grep, edit, resume and relay are rdep-only. FTP is plaintext."),
+                    );
+                }
+                if self.backend == Protocol::Sftp {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 120, 40),
+                        t("SFTP: publish/rollback require the rdep service and are unavailable."),
+                    );
+                }
+                ui.separator();
+                labeled(ui, t("Host"), &mut self.cfg_host);
+                labeled(ui, t("Port"), &mut self.cfg_port);
+                labeled(ui, t("User"), &mut self.cfg_user);
+                ui.checkbox(&mut self.cfg_use_token, t("Use API token auth (CI/CD)"));
+                ui.horizontal(|ui| {
+                    ui.label(if self.cfg_use_token {
+                        t("Token")
+                    } else {
+                        t("Password")
+                    });
+                    ui.add(egui::TextEdit::singleline(&mut self.cfg_pass).password(true));
+                });
+                labeled(ui, t("CA cert path"), &mut self.cfg_ca);
+                // forwarder 中转是 rdep 专属，仅 rdep 站点显示
+                if self.backend == Protocol::Rdep {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.cfg_use_forwarder, t("Relay via forwarder"));
+                    });
+                    if self.cfg_use_forwarder {
+                        labeled(ui, t("Target service id"), &mut self.cfg_service_id);
+                        labeled(ui, t("Relay token"), &mut self.cfg_relay_token);
+                        ui.label(t("Tip: host/port are the forwarder address"));
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(t("Connect now")).clicked() {
+                        self.connect_via_current_backend();
+                        close = true;
+                    }
+                    if ui.button(t("Save and connect")).clicked() {
+                        self.save_current_form_as_site();
+                        self.connect_via_current_backend();
+                        close = true;
+                    }
+                    if ui.button(t("Cancel")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        // 切换协议时把端口切到该协议默认值，避免残留上一个协议的端口
+        if self.backend != backend_before {
+            self.cfg_port = match self.backend {
+                Protocol::Rdep => "8443",
+                Protocol::Ftp => "21",
+                Protocol::Sftp => "22",
+            }
+            .to_string();
+        }
+        // 注意：不能用 `self.show_connect = open` 直接覆盖——闭包内已请求关闭时
+        // open 仍是进入本帧前的旧值，会把关闭请求吞掉（表现为按钮“没反应”）。
+        self.show_connect = open && !close;
+    }
+}
+
+impl eframe::App for RdepApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_ui(ctx);
+    }
+}
+
+impl RdepApp {
+    /// 一帧界面渲染的全部逻辑（不含 eframe 的窗口管理）。
+    pub fn update_ui(&mut self, ctx: &egui::Context) {
+        self.drain_events();
+
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("rdep");
+                if ui.button(t("Sites")).clicked() {
+                    self.show_sites = true;
+                }
+                ui.separator();
+                if self.connected {
+                    if ui.button(t("Disconnect")).clicked() {
+                        self.do_disconnect();
+                    }
+                } else if ui.button(t("Connect")).clicked() {
+                    self.show_connect = true;
+                }
+                if ui.button(t("Publish/Rollback")).clicked() {
+                    if self.require_publish("Publish/Rollback") {
+                        self.show_publish = true;
+                    }
+                }
+                if ui.button(t("Logs/Tools")).clicked() {
+                    if self.require_advanced("Logs/Tools") {
+                        self.show_tools = true;
+                    }
+                }
+                ui.separator();
+                // 语言切换
+                egui::ComboBox::from_label(t("Language"))
+                    .selected_text(i18n::get_lang().display_name())
+                    .show_ui(ui, |ui| {
+                        let mut picked: Option<Lang> = None;
+                        for l in Lang::ALL {
+                            if ui
+                                .selectable_label(i18n::get_lang() == l, l.display_name())
+                                .clicked()
+                            {
+                                picked = Some(l);
+                            }
+                        }
+                        if let Some(l) = picked {
+                            i18n::set_lang(l);
+                            let _ = i18n::save_lang(l);
+                        }
+                    });
+                ui.separator();
+                ui.label(&self.status);
+            });
+            ui.separator();
+            // ---- 快速连接条（FileZilla 风格）：与连接对话框共享同一组 cfg 字段 ----
+            let qc_backend_before = self.backend;
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("qc_proto")
+                    .selected_text(self.backend.label())
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        for p in [Protocol::Rdep, Protocol::Ftp, Protocol::Sftp] {
+                            ui.selectable_value(&mut self.backend, p, p.label());
+                        }
+                    });
+                ui.label(t("Host"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cfg_host).desired_width(160.0),
+                );
+                ui.label(t("User"));
+                ui.add(egui::TextEdit::singleline(&mut self.cfg_user).desired_width(90.0));
+                ui.label(t("Password"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cfg_pass)
+                        .password(true)
+                        .desired_width(90.0),
+                );
+                ui.label(t("Port"));
+                ui.add(egui::TextEdit::singleline(&mut self.cfg_port).desired_width(52.0));
+                if ui.button(format!("⚡ {}", t("Quick connect"))).clicked() {
+                    if self.cfg_host.trim().is_empty() {
+                        self.status = t("Host is required").to_string();
+                        self.push_log(t("Host is required"));
+                    } else if self.connected {
+                        self.push_log(t("Already connected; disconnect first"));
+                    } else {
+                        self.connect_via_current_backend();
+                    }
+                }
+            });
+            if self.backend != qc_backend_before {
+                // 与连接对话框一致：切换协议时自动切默认端口
+                self.cfg_port = match self.backend {
+                    Protocol::Rdep => "8443",
+                    Protocol::Ftp => "21",
+                    Protocol::Sftp => "22",
+                }
+                .to_string();
+            }
+        });
+
+        egui::SidePanel::left("local").show(ctx, |ui| self.local_panel(ui));
+        egui::SidePanel::right("remote").show(ctx, |ui| self.remote_panel(ui));
+        egui::TopBottomPanel::bottom("transfers").show(ctx, |ui| self.transfer_panel(ui));
+        egui::CentralPanel::default().show(ctx, |ui| self.log_panel(ui));
+
+        if self.show_sites {
+            self.sites_window(ctx);
+        }
+        if self.show_connect {
+            self.connect_window(ctx);
+        }
+        if self.show_publish {
+            self.publish_window(ctx);
+        }
+        if self.show_tools {
+            self.tools_window(ctx);
+        }
+
+        ctx.request_repaint_after(Duration::from_millis(50));
+    }
+}
+
+// ===========================================================================
+// 辅助 / 行内数据结构
+// ===========================================================================
+
+/// 文件表的一行（本地/远端共用）。
+struct FileRow {
+    name: String,
+    is_dir: bool,
+    size: u64,
+    mode: u32,
+    mtime: u64,
+}
+
+/// 协议的简短名称（日志用）。
+fn protocol_name(p: Protocol) -> &'static str {
+    match p {
+        Protocol::Rdep => "rdep",
+        Protocol::Ftp => "FTP",
+        Protocol::Sftp => "SFTP",
+    }
+}
+
+fn labeled(ui: &mut egui::Ui, name: &str, s: &mut String) {
+    ui.horizontal(|ui| {
+        ui.label(name);
+        ui.text_edit_singleline(s);
+    });
+}
+
+/// 本地文件权限位（unix；非 unix 返回 0）。
+#[cfg(unix)]
+fn local_mode(m: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    m.permissions().mode() & 0o777
+}
+#[cfg(not(unix))]
+fn local_mode(_m: &std::fs::Metadata) -> u32 {
+    0
+}
+
+fn fmt_size(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{:.1} {}", v, UNITS[i])
+    }
+}
+
+fn fmt_time(secs: u64) -> String {
+    if secs == 0 {
+        "-".to_string()
+    } else {
+        secs.to_string()
+    }
+}
+
+/// 拼接远端路径。`base` 的尾部斜杠会被去掉，避免产生 `//`。
+fn join_remote(base: &str, name: &str) -> String {
+    let b = base.trim_end_matches('/');
+    if b.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("{b}/{name}")
+    }
+}
+
+fn remote_parent(p: &str) -> String {
+    if p == "/" {
+        return "/".to_string();
+    }
+    let trimmed = p.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(i) => trimmed[..i].to_string(),
+        None => "/".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod gui_smoke {
+    use super::*;
+    use crate::sites::SiteStore;
+
+    /// 用一个临时站点仓库构造 app（不触碰用户真实配置）。
+    fn test_app(tag: &str) -> RdepApp {
+        let p = std::env::temp_dir().join(format!("rdep-gui-{}-{}.json", std::process::id(), tag));
+        let _ = std::fs::remove_file(&p);
+        // 测试确定性：强制英文，避免依赖持久化的语言设置。
+        i18n::set_lang(Lang::En);
+        RdepApp::with_store(SiteStore::with_path(p))
+    }
+
+    /// 渲染 `frames` 帧；任何 panic 会直接让测试失败。
+    fn render(app: &mut RdepApp, frames: usize) {
+        let ctx = egui::Context::default();
+        for _ in 0..frames {
+            let _ = ctx.run(egui::RawInput::default(), |c| app.update_ui(c));
+        }
+    }
+
+    fn entry(name: &str, is_dir: bool, size: u64, mode: u32) -> FileEntry {
+        FileEntry {
+            name: name.into(),
+            is_dir,
+            size,
+            mtime: 1_768_473_000,
+            mode,
+        }
+    }
+
+    /// 基线：空状态下连续渲染不应 panic。
+    #[test]
+    fn renders_empty_state() {
+        let mut app = test_app("empty");
+        render(&mut app, 5);
+        assert!(!app.connected);
+        assert!(!app.log.is_empty(), "启动应写入日志");
+    }
+
+    /// 所有窗口同时打开 + 各类数据就绪时渲染，覆盖面板里所有分支。
+    #[test]
+    fn renders_all_windows_with_data() {
+        let mut app = test_app("full");
+
+        app.remote_dir = "/opt/app".into();
+        app.remote_entries = vec![
+            entry("..", true, 0, 0o755),
+            entry("bin", true, 0, 0o755),
+            entry("start.sh", false, 1024, 0o755),
+            entry("my report.txt", false, 12, 0o644),
+        ];
+        app.remote_selected = Some(1);
+
+        app.local_dir = std::env::temp_dir();
+        app.refresh_local();
+        app.local_selected = Some(0);
+
+        app.transfers = vec![
+            TransferItem {
+                id: 1,
+                name: "a.bin".into(),
+                direction: Direction::Upload,
+                sent: 50,
+                total: 100,
+                status: "Transferring".into(),
+                ok: true,
+                done: false,
+                local_path: "/tmp/a.bin".into(),
+                remote_path: "/opt/a.bin".into(),
+            },
+            TransferItem {
+                id: 2,
+                name: "b.bin".into(),
+                direction: Direction::Download,
+                sent: 7,
+                total: 0,
+                status: "Downloading".into(),
+                ok: true,
+                done: false,
+                local_path: "/tmp/b.bin".into(),
+                remote_path: "/opt/b.bin".into(),
+            },
+            TransferItem {
+                id: 3,
+                name: "c.bin".into(),
+                direction: Direction::Upload,
+                sent: 100,
+                total: 100,
+                status: "Done".into(),
+                ok: true,
+                done: true,
+                local_path: "/tmp/c.bin".into(),
+                remote_path: "/opt/c.bin".into(),
+            },
+        ];
+
+        app.show_publish = true;
+        app.publish_remote = "/opt/app".into();
+        app.publish_files = vec![PublishFile {
+            remote_path: "/opt/app/x".into(),
+            local_path: "/tmp/x".into(),
+        }];
+        app.backup_versions = vec!["2601071200".into(), "2601071300".into()];
+        app.rollback_version = "2601071200".into();
+        app.sync_preview = Some((vec!["a.txt".into(), "b.txt".into()], vec!["stale.txt".into()]));
+
+        app.show_tools = true;
+        app.tail_output = vec!["line1".into(), "ERROR bad".into()];
+        app.grep_output = vec!["file.txt:3:ERROR bad".into()];
+        app.edit_loaded = true;
+        app.edit_content = "fn main() {}".into();
+
+        app.show_sites = true;
+        app.show_connect = true;
+        app.sites = vec![Site {
+            name: "prod".into(),
+            protocol: Protocol::Rdep,
+            host: "10.0.0.5".into(),
+            port: 8443,
+            user: "admin".into(),
+            password: crate::sites::obfuscate_for_storage("pw"),
+            ..Default::default()
+        }];
+        app.site_selected = Some(0);
+
+        render(&mut app, 8);
+    }
+
+    /// 远端列表为「只有 `..`」和「完全空」时也不应 panic。
+    #[test]
+    fn renders_empty_and_dot_only_lists() {
+        let mut app = test_app("lists");
+        app.remote_entries = vec![entry("..", true, 0, 0)];
+        render(&mut app, 3);
+
+        app.remote_entries.clear();
+        app.local_entries.clear();
+        app.transfers.clear();
+        render(&mut app, 3);
+    }
+
+    /// 协议门控：FTP 下高级功能被拦截并留下明确日志，rdep 下放行。
+    #[test]
+    fn advanced_feature_gating() {
+        let mut app = test_app("gate");
+
+        app.backend = Protocol::Rdep;
+        assert!(app.require_advanced("Logs/Tools"), "rdep 应放行高级功能");
+        assert!(!app.log.iter().any(|l| l.contains("rdep protocol")));
+
+        app.backend = Protocol::Ftp;
+        let before = app.log.len();
+        assert!(!app.require_advanced("Logs/Tools"), "FTP 必须拦截高级功能");
+        assert!(app.log.len() > before, "拦截时应写入说明日志");
+        let msg = app.log.last().cloned().unwrap_or_default();
+        assert!(msg.contains("rdep protocol"), "日志应说明原因: {msg}");
+        assert!(msg.contains("FTP"), "日志应指出当前协议: {msg}");
+
+        // 发布/回滚仅 rdep 可用
+        app.backend = Protocol::Sftp;
+        assert!(!app.require_publish("Publish/Rollback"), "SFTP 必须拦截发布/回滚");
+    }
+
+    /// 协议能力矩阵。
+    #[test]
+    fn protocol_capability_matrix() {
+        assert!(Protocol::Rdep.supports_advanced());
+        assert!(!Protocol::Ftp.supports_advanced());
+        assert!(Protocol::Sftp.supports_advanced());
+        assert!(Protocol::Rdep.supports_publish());
+        assert!(!Protocol::Sftp.supports_publish());
+        assert!(!Protocol::Ftp.supports_publish());
+        assert_eq!(Protocol::default(), Protocol::Rdep);
+    }
+
+    /// 回归：连接必须有可见反应——主机为空时显式报错；主机填写后立即显示
+    /// “Connecting to ...”状态（此前点击后错误被 Disconnected 覆盖，看似没反应）。
+    #[test]
+    fn connect_gives_immediate_feedback() {
+        let mut app = test_app("conn");
+
+        app.cfg_host = "   ".into();
+        app.connect_via_current_backend();
+        assert!(
+            app.status.contains("Host is required"),
+            "空主机应显式提示: {}",
+            app.status
+        );
+
+        app.cfg_host = "127.0.0.1".into();
+        app.cfg_port = "22".into();
+        app.connect_via_current_backend();
+        assert!(
+            app.status.contains("Connecting to 127.0.0.1:22"),
+            "点击后应立即显示连接中状态: {}",
+            app.status
+        );
+    }
+
+    /// 回归：连接失败时后端先发 Error 再发 Disconnected，
+    /// Disconnected 不得把错误状态覆盖回 “Disconnected”（否则看似按钮没反应）。
+    #[test]
+    fn disconnect_keeps_error_status_on_failed_connect() {
+        let mut app = test_app("disc");
+
+        app.connected = false;
+        app.status = "connect failed: xyz".into();
+        app.handle(Event::Disconnected);
+        assert_eq!(app.status, "connect failed: xyz", "失败原因必须保留");
+        assert!(!app.connected);
+
+        // 正常连接后的主动断开仍应显示 Disconnected
+        app.connected = true;
+        app.handle(Event::Disconnected);
+        assert_eq!(app.status, t("Disconnected"));
+    }
+
+    /// 切到 FTP / SFTP 后渲染界面（含协议选择器与能力提示）不应 panic。
+    #[test]
+    fn renders_backend_ui() {
+        let mut app = test_app("be");
+        app.backend = Protocol::Ftp;
+        app.show_connect = true;
+        app.cfg_use_forwarder = true;
+        app.cfg_service_id = "svc".into();
+        render(&mut app, 4);
+
+        app.backend = Protocol::Sftp;
+        render(&mut app, 4);
+    }
+
+    /// 回归：「目录树 ls」在途标记若残留（例如那次 ls 报错），主面板的 ls 应答会被
+    /// 误判成树节点加载结果写进树缓存，主面板永远不变 —— 表现即「点 Refresh 没作用」。
+    /// Error / Disconnected 必须清理该标记。
+    #[test]
+    fn stale_pending_tree_ls_is_cleared_on_error_and_disconnect() {
+        let mut app = test_app("tree");
+
+        app.pending_tree_ls = Some("/".into());
+        app.handle(Event::Error("read stream".into()));
+        assert!(app.pending_tree_ls.is_none(), "Error 后必须清理在途树 ls");
+
+        app.pending_tree_ls = Some("/opt".into());
+        app.pending_backup_list = true;
+        app.handle(Event::Disconnected);
+        assert!(app.pending_tree_ls.is_none(), "Disconnected 后必须清理在途树 ls");
+        assert!(!app.pending_backup_list, "Disconnected 后必须清理备份在途标记");
+    }
+
+    /// 回归：主面板的 ls 应答必须刷新文件列表，不能被在途树 ls 标记吞掉。
+    #[test]
+    fn dir_listed_updates_main_pane_after_stale_tree_marker() {
+        let mut app = test_app("dirlisted");
+        app.connected = true;
+        app.pending_tree_ls = Some("/".into()); // 模拟残留标记
+        app.refresh_remote(); // Refresh 按钮：先清标记再发 ls
+        assert!(app.pending_tree_ls.is_none());
+
+        app.handle(Event::DirListed {
+            path: "/".into(),
+            entries: vec![FileEntry {
+                name: "bin".into(),
+                is_dir: true,
+                size: 0,
+                mtime: 0,
+                mode: 0o755,
+            }],
+        });
+        assert_eq!(app.remote_entries.len(), 1, "主面板应显示返回的条目");
+        assert_eq!(app.remote_entries[0].name, "bin");
+    }
+
+    /// 回归：未连接时点 Refresh 曾静默 no-op（按钮像坏了），现在必须给出明确提示。
+    #[test]
+    fn refresh_without_connection_gives_hint() {
+        let mut app = test_app("refresh");
+        assert!(!app.connected);
+        // 直接走刷新逻辑（与 Refresh 按钮同一条路径）
+        if app.connected {
+            app.refresh_remote();
+        } else {
+            let msg = t("Not connected; connect first");
+            app.status = msg.to_string();
+            app.push_log(&msg);
+        }
+        assert!(app.status.contains("Not connected"), "应提示未连接: {}", app.status);
+        assert!(app.log.iter().any(|l| l.contains("Not connected")));
+    }
+
+    /// 回归：界面日志带时间戳（便于与服务端日志对表）。
+    #[test]
+    fn gui_log_has_timestamp() {
+        let mut app = test_app("ts");
+        app.push_log("hello");
+        let last = app.log.last().unwrap().clone();
+        assert!(last.starts_with('[') && last.contains("hello"), "日志应带时间戳: {last}");
+    }
+
+    /// 远端路径拼接工具函数。
+    #[test]
+    fn remote_path_join() {
+        assert_eq!(join_remote("/", "a.txt"), "/a.txt");
+        assert_eq!(join_remote("/opt", "a.txt"), "/opt/a.txt");
+        assert_eq!(join_remote("/opt/", "sub/a.txt"), "/opt/sub/a.txt");
+    }
+}

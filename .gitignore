@@ -1,0 +1,13 @@
+/target
+**/target
+*.swp
+.DS_Store
+
+# 构建产物
+/dist
+
+# 真实证书/私钥不入库（保留说明文件）
+/deploy/certs/*
+!/deploy/certs/README.md
+*.key
+*.pem

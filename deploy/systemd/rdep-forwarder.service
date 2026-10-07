@@ -1,0 +1,43 @@
+[Unit]
+Description=rdep Forwarder (公网中转代理)
+Documentation=https://github.com/maczh/rdep
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rdep
+Group=rdep
+# ---- 两个监听端口：service 注册(9444) / client 会话(9443) ----
+Environment=RDEP_FWD_SERVICE_LISTEN=0.0.0.0:9444
+Environment=RDEP_FWD_CLIENT_LISTEN=0.0.0.0:9443
+Environment=RDEP_FWD_DB=/var/lib/rdep/forwarder.db
+# ---- 中转密钥：务必改成与各 service 一致的强随机值 ----
+Environment=RDEP_RELAY_TOKEN=change-me
+# ---- TLS 证书 ----
+Environment=RDEP_FWD_CERT=/etc/rdep/certs/forwarder.crt
+Environment=RDEP_FWD_KEY=/etc/rdep/certs/forwarder.key
+# ---- Web 管理后台（默认只监听本机）----
+Environment=RDEP_FWD_WEB_LISTEN=127.0.0.1:8081
+
+ExecStart=/usr/local/bin/rdep-forwarder
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# ---- 安全加固 ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+ReadWritePaths=/var/lib/rdep
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,81 @@
+# rdep 部署编排：forwarder(公网中转) + service(内网发布)
+#
+# 前置：把真实 TLS 证书放到 ./certs/（见 deploy/certs/README.md），
+#      并把 RELAY_TOKEN 换成强随机值。
+#
+#   cp deploy/certs/README.md deploy/certs/   # 目录已 gitignore 自建
+#   openssl req -x509 -newkey rsa:4096 -nodes -days 3650 \
+#     -keyout certs/server.key -out certs/server.crt \
+#     -subj "/CN=forwarder.example.com" -addext "subjectAltName=DNS:forwarder.example.com"
+#   # 把 .crt 拷进各 service 容器作为 forwarder CA
+#
+# 启动：docker compose up -d
+
+services:
+  forwarder:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        BUILD_TARGET: forwarder
+    image: rdep:forwarder
+    container_name: rdep-forwarder
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/rdep-forwarder"]
+    environment:
+      RDEP_FWD_SERVICE_LISTEN: "0.0.0.0:9444"
+      RDEP_FWD_CLIENT_LISTEN: "0.0.0.0:9443"
+      RDEP_FWD_DB: "/var/lib/rdep/forwarder.db"
+      RDEP_RELAY_TOKEN: "${RELAY_TOKEN:?set RELAY_TOKEN in .env}"
+      RDEP_FWD_CERT: "/etc/rdep/certs/server.crt"
+      RDEP_FWD_KEY: "/etc/rdep/certs/server.key"
+      RDEP_FWD_WEB_LISTEN: "0.0.0.0:8081"
+    volumes:
+      - ./certs:/etc/rdep/certs:ro
+      - forwarder-data:/var/lib/rdep
+    ports:
+      - "9443:9443"   # client 会话
+      - "9444:9444"   # service 注册
+      - "8081:8081"   # Web 管理
+
+  # 内网目标机上的 service（示例：再复制一份改 SERVICE_ID 即可多机）
+  service-1:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        BUILD_TARGET: service
+    image: rdep:service
+    container_name: rdep-service-1
+    restart: unless-stopped
+    depends_on:
+      - forwarder
+    environment:
+      RDEP_LISTEN: "0.0.0.0:8443"
+      RDEP_ROOT: "/var/lib/rdep/root"
+      RDEP_DB: "/var/lib/rdep/rdep.db"
+      RDEP_SCRIPTS: "/var/lib/rdep/scripts"
+      RDEP_BACKUP_KEEP: "10"
+      RDEP_CERT: "/etc/rdep/certs/server.crt"
+      RDEP_KEY: "/etc/rdep/certs/server.key"
+      RDEP_WEB_LISTEN: "0.0.0.0:8080"
+      # 经 forwarder 注册
+      RDEP_USE_FORWARDER: "1"
+      RDEP_FWD_HOST: "forwarder"
+      RDEP_FWD_PORT: "9444"
+      RDEP_FWD_CA: "/etc/rdep/certs/server.crt"
+      RDEP_RELAY_TOKEN: "${RELAY_TOKEN}"
+      RDEP_SERVICE_ID: "svc-1"
+      RDEP_SERVICE_LABEL: "target-1"
+    volumes:
+      - ./certs:/etc/rdep/certs:ro
+      - service-1-data:/var/lib/rdep
+      # 把要发布的代码目录挂进去
+      - /srv/app:/var/lib/rdep/root/app:rw
+    ports:
+      - "8443:8443"
+      - "8080:8080"
+
+volumes:
+  forwarder-data:
+  service-1-data:
