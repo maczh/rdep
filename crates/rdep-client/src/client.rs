@@ -10,13 +10,12 @@ use anyhow::{Context, Result};
 use rdep_protocol::transport::FrameCodec;
 use rdep_protocol::relay::{RelayConnect, RelayConnectResp};
 use rdep_protocol::{
-    AuthMethod, AuthRequest, BackupsRequest, BackupsResponse, CmdRequest, CmdResponse, CmdType, Ctrl,
-    DataChunk, DeleteRequest,
-    Direction, DownloadRequest, EditRequest, FileEntry, Frame, FrameFlags, FrameType, GrepRequest,
-    GrepResponse, LsRequest, LsResponse, MkdirRequest, MoveRequest, CopyPolicy, CopyRequest,
-    NamePolicy, PublishCommitRequest, PublishItem, PublishRequest, RenameRequest,
-    RollbackRequest, StreamPush, TailRequest, UploadCommit, UploadInit, UploadInitAck, sha256,
-    CHUNK_SIZE_DEFAULT,
+    AuthMethod, AuthRequest, BackupsRequest, BackupsResponse, ChmodRequest, CmdRequest, CmdResponse,
+    CmdType, Ctrl, DataChunk, DeleteRequest, Direction, DownloadRequest, DownloadResponse, EditRequest,
+    FileEntry, Frame, FrameFlags, FrameType, GrepRequest, GrepResponse, LsRequest, LsResponse,
+    MkdirRequest, MoveRequest, CopyPolicy, CopyRequest, NamePolicy, PublishCommitRequest,
+    PublishItem, PublishRequest, RenameRequest, RollbackRequest, StreamPush, TailRequest,
+    UploadCommit, UploadInit, UploadInitAck, sha256, CHUNK_SIZE_DEFAULT,
 };
 use rustls::pki_types::ServerName;
 use rustls::RootCertStore;
@@ -88,6 +87,8 @@ pub enum Command {
         delete_extra: bool,
         dry_run: bool,
     },
+    /// 远端 `chmod`：在 `path` 上设置权限位 `mode`（unix `st_mode & 0o777`）。
+    Chmod { path: String, mode: u32 },
 }
 
 /// 后台 → GUI 的事件。
@@ -179,6 +180,39 @@ fn file_mode(path: &std::path::Path) -> u32 {
 #[cfg(not(unix))]
 fn file_mode(_path: &std::path::Path) -> u32 {
     0
+}
+
+/// 读取本地文件 mtime（Unix 秒；读取失败返回 0 表示不设置）。
+fn file_mtime(path: &std::path::Path) -> i64 {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 把权限位 `mode` 应用到本地 `path`（仅 unix 有效；非 unix / mode==0 忽略）。
+#[cfg(unix)]
+fn apply_local_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if mode != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777))?;
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn apply_local_mode(_path: &std::path::Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// 把 mtime `t` 应用到本地 `path`（t<=0 忽略）。本工具链 std 用 `set_times` 而非 `set_modified`。
+fn apply_local_mtime(path: &std::path::Path, t: i64) -> std::io::Result<()> {
+    if t <= 0 {
+        return Ok(());
+    }
+    let sys = std::time::UNIX_EPOCH + std::time::Duration::from_secs(t as u64);
+    std::fs::set_times(path, std::fs::FileTimes::new().set_modified(sys))
 }
 
 /// 流式统计文件：返回 `(size, sha256, total_chunks)`，不把整文件读进内存。
@@ -386,6 +420,10 @@ impl Client {
             remote_path,
             content,
         });
+    }
+    /// 远端 `chmod`：在 `path` 上设置权限位 `mode`（unix `st_mode & 0o777`）。
+    pub fn chmod(&self, path: String, mode: u32) {
+        let _ = self.cmd_tx.blocking_send(Command::Chmod { path, mode });
     }
     /// 目录同步：本地目录 → 远端目录（按大小+mtime 判定变更，备份后覆盖）。
     /// `delete_extra` 删除远端多余文件；`dry_run` 仅统计。
@@ -656,6 +694,16 @@ async fn client_task(
                     );
                 }
             }
+            Command::Chmod { path, mode } => match &mut session {
+                Some(s) => do_simple(
+                    s,
+                    CmdType::Chmod,
+                    &ChmodRequest { path, mode },
+                    &evt_tx,
+                )
+                .await,
+                None => send(&evt_tx, Event::OpDone { ok: false, message: "not connected".into() }),
+            },
         }
     }
 }
@@ -1005,7 +1053,7 @@ async fn do_upload(
             transfer_id: id,
             remote_path: name.clone(),
             size,
-            mtime: 0,
+            mtime: file_mtime(lp),
             chunk_size: CHUNK_SIZE_DEFAULT as u32,
             total_chunks: total,
             file_sha256: sha,
@@ -1124,6 +1172,9 @@ async fn do_download(
     let mut hasher = Sha256::new();
     let mut sent = 0u64;
     let mut expected_sha: Option<[u8; 32]> = None;
+    // 远端的权限位与 mtime，下载完成后还原到本地文件（实现「下载后属性/时间一致」）。
+    let mut remote_mode: u32 = 0;
+    let mut remote_mtime: i64 = 0;
     let mut failed: Option<String> = None;
 
     loop {
@@ -1167,10 +1218,11 @@ async fn do_download(
                     failed = Some(r.message);
                     break;
                 }
-                if r.body.len() == 32 {
-                    let mut a = [0u8; 32];
-                    a.copy_from_slice(&r.body);
-                    expected_sha = Some(a);
+                // 应答体为 DownloadResponse{ mode, mtime, sha256 }（postcard 编码）
+                if let Ok(dr) = postcard::from_bytes::<DownloadResponse>(&r.body) {
+                    expected_sha = Some(dr.sha256);
+                    remote_mode = dr.mode;
+                    remote_mtime = dr.mtime;
                 }
                 break;
             }
@@ -1207,6 +1259,14 @@ async fn do_download(
         let _ = std::fs::remove_file(&tmp_path);
         send(evt, Event::TransferDone { id, ok: false, message: format!("rename: {e}") });
         return;
+    }
+    // 还原远端文件的权限位与 mtime（仅 unix 有效；记警告不阻断下载成功）
+    let lp = std::path::Path::new(local_path);
+    if let Err(e) = apply_local_mode(lp, remote_mode) {
+        tracing::warn!(path = %local_path, "download: apply mode failed: {e}");
+    }
+    if let Err(e) = apply_local_mtime(lp, remote_mtime) {
+        tracing::warn!(path = %local_path, mtime = remote_mtime, "download: apply mtime failed: {e}");
     }
     send(evt, Event::TransferDone { id, ok: true, message: String::new() });
 }
@@ -1306,7 +1366,7 @@ async fn do_publish(
                 transfer_id: *id,
                 remote_path: remote_path.clone(),
                 size: *size,
-                mtime: 0,
+                mtime: file_mtime(std::path::Path::new(local_path)),
                 chunk_size: CHUNK_SIZE_DEFAULT as u32,
                 total_chunks: *total,
                 file_sha256: *sha,
@@ -2001,7 +2061,7 @@ async fn upload_file_backup(
             transfer_id: id,
             remote_path: remote_path.to_string(),
             size,
-            mtime: 0,
+            mtime: file_mtime(local_abs),
             chunk_size: CHUNK_SIZE_DEFAULT as u32,
             total_chunks: total,
             file_sha256: sha,

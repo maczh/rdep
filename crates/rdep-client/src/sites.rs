@@ -88,6 +88,29 @@ pub struct Site {
     /// 该站点用 **API 令牌** 而口令认证；此时 `password` 字段存的是令牌明文（混淆后）。
     #[serde(default)]
     pub use_token: bool,
+    // ---- FileZilla 风格站点字段（全部持久化到 sites.json） ----
+    /// 登录类型：`Normal`（用户名+密码）/ `Key`（密钥，预留）/ `Ask`（每次询问）。
+    /// 用字符串存储以兼容老配置（缺省视为 Normal）。
+    #[serde(default)]
+    pub login_type: String,
+    /// 站点背景颜色（FileZilla 风格的标签颜色，CSS 十六进制如 `#1E90FF`）。
+    #[serde(default)]
+    pub background_color: String,
+    /// 备注（FileZilla 的「注释」栏）。
+    #[serde(default)]
+    pub comment: String,
+    /// 高级：默认本地目录（连接后本地面板落点）。
+    #[serde(default)]
+    pub default_local_dir: String,
+    /// 高级：默认远端目录（连接后远端面板落点）。
+    #[serde(default)]
+    pub default_remote_dir: String,
+    /// 传输设置：并发传输数（仅 UI 保存，未接入调度器）。
+    #[serde(default)]
+    pub concurrency: u8,
+    /// 字符集：`Auto`（默认，跟随服务端）/ `UTF-8`（强制）。
+    #[serde(default)]
+    pub charset: String,
 }
 
 impl Site {
@@ -97,6 +120,9 @@ impl Site {
             host: "127.0.0.1".into(),
             port: 8443,
             user: "admin".into(),
+            login_type: "Normal".into(),
+            concurrency: 2,
+            charset: "Auto".into(),
             ..Default::default()
         }
     }
@@ -385,6 +411,7 @@ mod tests {
             relay_token: obfuscate("tok"),
             last_remote_dir: "/opt/app".into(),
             use_token: false,
+            ..Default::default()
         })
         .unwrap();
 

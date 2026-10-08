@@ -201,6 +201,52 @@ impl Storage {
         Ok(())
     }
 
+    /// 远端 `chmod`：在 root 内的 `path` 上设置权限位（unix `st_mode & 0o777`）。
+    ///
+    /// 路径必须经 `resolve()` 校验（防越权），`mode == 0` 直接忽略（调用方不该传 0）。
+    pub fn chmod(&self, path: &str, mode: u32) -> Result<()> {
+        if mode == 0 {
+            anyhow::bail!("chmod: invalid mode 0 (use the file's existing mode)");
+        }
+        let dest = self.resolve(path)?;
+        tracing::debug!(requested = %path, resolved = %dest.display(), mode = format!("{mode:o}"), "storage.chmod");
+        self.apply_mode(&dest, mode)
+            .with_context(|| format!("chmod {} to {mode:o}", path))
+    }
+
+    /// 把 `path` 的修改时间（mtime）设为 `mtime`（Unix 秒）。用于上传后「保留原文件时间」。
+    ///
+    /// 路径经 `resolve()` 校验。服务端通常用 `std::fs::set_modified`（跨平台），
+    /// 在 unix 上等价设置 mtime。`mtime <= 0` 视为无效，忽略。
+    pub fn set_mtime(&self, path: &str, mtime: i64) -> Result<()> {
+        if mtime <= 0 {
+            return Ok(()); // 没有有意义的时间戳，保持现状，不算错误
+        }
+        let dest = self.resolve(path)?;
+        let dur = std::time::Duration::from_secs(mtime as u64);
+        let system_time = std::time::UNIX_EPOCH + dur;
+        tracing::debug!(requested = %path, resolved = %dest.display(), mtime, "storage.set_mtime");
+        // 注意：本工具链 std 未提供 `std::fs::set_modified`，改用 `set_times` +
+        // `FileTimes::set_modified`（等价设置 mtime）。
+        std::fs::set_times(&dest, std::fs::FileTimes::new().set_modified(system_time))
+            .with_context(|| format!("set mtime on {} to {mtime}", path))
+    }
+
+    /// 读取文件并一并返回其**权限位**与**修改时间**，供下载时把属性随文件交还客户端。
+    pub fn read_file_meta(&self, remote_path: &str) -> Result<(Vec<u8>, u32, i64)> {
+        let path = self.resolve(remote_path)?;
+        let data = std::fs::read(&path).with_context(|| format!("read {}", remote_path))?;
+        let meta = std::fs::metadata(&path)?;
+        let mode = mode_of(&meta);
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Ok((data, mode, mtime))
+    }
+
     // ---- 断点续传暂存区 ----
     // 每个 transfer_id 一个目录，内含 `<index>.chunk` 文件；「已收片集合」= 现存
     // 的 chunk 文件，无需额外位图持久化，天然支持跨连接/跨会话续传。
@@ -675,6 +721,106 @@ mod staging_tests {
             .expect("gc reap");
         assert_eq!(n, 2, "all stale staging should be reaped at TTL=0");
         assert!(!d111.exists() && !d222.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod preservation_tests {
+    use super::*;
+
+    fn tmp_storage(tag: &str) -> (Storage, PathBuf) {
+        let root = std::env::temp_dir().join(format!("rdep-presv-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        let meta = root.join("meta");
+        let s = Storage::with_meta(root.clone(), meta, 10).expect("storage");
+        (s, root)
+    }
+
+    /// 文件属性往返：保存内容 → set_mtime + apply_mode 后，read_file_meta 能取回
+    /// 正确的模式与时间（对应「上传/编辑后保持文件属性、时间与原文件相同」）。
+    #[test]
+    fn mtime_and_mode_preserved_through_meta() {
+        let (s, root) = tmp_storage("meta");
+        let rel = "conf/app.yaml";
+        let full = root.join("conf").join("app.yaml");
+        // 直接落盘内容（绕开 resolve 路径限制，测试语义用真实文件）
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, b"version: 1").unwrap();
+
+        let want_mtime: i64 = 1_700_000_000; // 固定秒级时间戳
+        s.set_mtime(rel, want_mtime).expect("set mtime");
+
+        #[cfg(unix)]
+        s.apply_mode(&full, 0o640).expect("set mode");
+
+        let (data, mode, mtime) = s.read_file_meta(rel).expect("read meta");
+        assert_eq!(data, b"version: 1");
+        assert_eq!(mtime, want_mtime, "mtime 应被 read_file_meta 取回");
+        #[cfg(unix)]
+        assert_eq!(mode & 0o777, 0o640, "mode 应被 read_file_meta 取回");
+
+        // set_mtime(<=0) 应为 no-op（不报错、不改时间）
+        s.set_mtime(rel, 0).expect("set mtime 0 is noop");
+        let (_, _, mtime2) = s.read_file_meta(rel).expect("read meta again");
+        assert_eq!(mtime2, want_mtime, "mtime<=0 不应改变已有时间");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// chmod：远端执行 chmod 应改变文件权限，且不影响内容。
+    #[test]
+    fn chmod_changes_mode() {
+        let (s, root) = tmp_storage("chmod");
+        let rel = "bin/run.sh";
+        let full = root.join("bin").join("run.sh");
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, b"#!/bin/sh\necho hi").unwrap();
+        #[cfg(unix)]
+        s.apply_mode(&full, 0o644).unwrap();
+
+        s.chmod(rel, 0o755).expect("chmod");
+        let (data, mode, _) = s.read_file_meta(rel).expect("read meta");
+        assert_eq!(data, b"#!/bin/sh\necho hi", "chmod 不应改内容");
+        #[cfg(unix)]
+        assert_eq!(mode & 0o777, 0o755, "chmod 后应变为 0755");
+
+        // mode=0 视为非法，应返回错误
+        assert!(s.chmod(rel, 0).is_err(), "chmod 0 应被拒绝");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 编辑保存：save_with_backup 先备份原内容，再用新内容覆盖原文件名。
+    /// 对应「编辑保存 = 先改名备份，再上传新内容成原文件名」。
+    #[test]
+    fn edit_save_backs_up_then_overwrites() {
+        let (s, root) = tmp_storage("editbak");
+        let rel = "app/config.txt";
+        let full = root.join("app").join("config.txt");
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, b"OLD CONTENT").unwrap();
+
+        s.save_with_backup(rel, b"NEW CONTENT").expect("save with backup");
+
+        // 原文件名落新内容
+        assert_eq!(std::fs::read(&full).unwrap(), b"NEW CONTENT");
+        // 备份库中保留了旧内容
+        let backup_root = root.join("meta").join("backup");
+        assert!(backup_root.is_dir(), "应生成备份目录");
+        let mut found_old = false;
+        for entry in std::fs::read_dir(&backup_root).unwrap().flatten() {
+            let version_dir = entry.path();
+            if version_dir.is_dir() {
+                let bak = version_dir.join("app").join("config.txt");
+                if bak.is_file() && std::fs::read(&bak).unwrap() == b"OLD CONTENT" {
+                    found_old = true;
+                }
+            }
+        }
+        assert!(found_old, "备份中应保留原始 OLD CONTENT");
 
         let _ = std::fs::remove_dir_all(&root);
     }

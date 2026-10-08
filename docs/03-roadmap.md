@@ -2,7 +2,7 @@
 
 > 原则：先协议后业务、先 service 后 client、中转与 Web 管理后置。每阶段可独立验证。
 >
-> **状态：Phase 0–7 已全部完成并验证。** 每阶段交付说明见 `docs/phase{N}-overview.md`；
+> **状态：Phase 0–7 已全部完成并验证；Phase 8（client 体验增强）已交付。** 每阶段交付说明见 `docs/phase{N}-overview.md`；
 > 快速上手见根目录 `README.md`，部署产物见 `deploy/`。
 
 ## Phase 0 — 地基：workspace + rdep-protocol
@@ -63,3 +63,39 @@ Phase0 ─► Phase1 ─► Phase2 ─► Phase3 ─► Phase4
 - 最短可用路径（MVP）：Phase 0→1→2→3（直连即可发布/回滚）。
 - 公网场景追加：Phase 5。
 - 产品化追加：Phase 4、6、7。
+
+## Phase 8 — client 体验增强（已交付）
+承接 Phase 2/4 的站点管理与运维能力，补齐 FileZilla 风格的易用性与属性保留细节。
+对应需求：站点管理 UI 重构、tail/grep/edit 体验、上传下载属性保留、远程 chmod。
+
+1. **FileZilla 风格站点管理器**（`rdep-client::app::sites_window`）
+   - 左侧「My Sites」可折叠站点树 + 新建/删除；右侧四页签：General / Advanced / Transfer Settings / Charset。
+   - 支持 sftp / ftp / rdep 三类协议；切换协议自动同步默认端口（22 / 21 / 8443）。
+   - 新增字段全部持久化到本地 `sites.json`：`login_type`（Normal/Key file/Ask）、
+     `background_color`、`comment`、`default_local_dir`、`default_remote_dir`、`concurrency`（1–16）、`charset`（Auto/UTF-8）。
+   - 改名保存时若站点名变化会先删除旧条目（`save_current_form_as_site` 改名保护）。
+
+2. **tail 对话框体验**（`tail_dialog`）
+   - 日志编辑框只读 + 自动滚动到底部（`scroll_to_cursor(BOTTOM)`）。
+   - 收到新日志行（`Event::TailLine`）置 `tail_view_dirty`，渲染后复位，保证跟进最新内容。
+   - 窗口关闭（`!open && tail_follow`）自动执行 stop follow 并记日志「tail stopped」。
+
+3. **grep 结果标红**（`render_grep_match`）
+   - 匹配子串用红色 `Color32::RED` 高亮（等宽字体 LayoutJob 逐段拼接）；大小写忽略开关安全处理非 ASCII。
+
+4. **编辑保存 = 先备份后覆盖**（`rdep-service::storage::save_with_backup`）
+   - 编辑保存时先把原文件复制进 `meta/backup/<版本戳>/<相对路径>`，再用新内容覆盖原文件名（满足「先改名备份，再上传新内容成原文件名」）。
+
+5. **上传/下载保留文件属性与时间**
+   - 上传：`set_mtime`（`std::fs::set_times`）+ `apply_mode` 保留 mtime 与权限位。
+   - 下载：`DownloadResponse{mode, mtime, sha256}` 带回属性，client 侧 `apply_local_mode`/`apply_local_mtime` 还原。
+
+6. **右键「权限」→ 远程 chmod（rdep only）**
+   - 远程文件右键菜单新增「Permissions」按钮 → `chmod_dialog` 输入八进制模式（0–0o7777 校验）。
+   - 协议层 `CmdType::Chmod` / `ChmodRequest{path,mode}`、service `storage::chmod`、client `Client::chmod` 全链路打通。
+   - 因高版 SFTP `SftpSession` 无 `setstat`，chmod 仅 rdep 协议支持；ftp/sftp 点击时给出明确提示「requires the rdep protocol...」。
+
+- **验证**：`cargo test -p rdep-protocol -p rdep-service -p rdep-client`（lib 76 + integration 18 全绿）；
+  `cargo clippy --all-targets` 无 error。新增/增强单测覆盖：站点字段往返、grep 标红渲染、tail 脏标记、
+  chmod rdep/ftp 门控、八进制解析、备份改名覆盖、mtime/mode 保留。
+- **详细**：见 `docs/phase8-overview.md`。

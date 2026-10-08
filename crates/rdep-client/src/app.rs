@@ -113,6 +113,20 @@ pub struct RdepApp {
     site_name_input: String,
     site_remember_pass: bool,
     show_sites: bool,
+    /// FileZilla 风格站点表单（连接框 + 站点管理器共享）：
+    /// 登录类型 / 背景颜色 / 注释 / 默认本地目录 / 默认远端目录 / 并发数 / 字符集。
+    cfg_login_type: String,
+    site_bg_color: String,
+    site_comment: String,
+    site_default_local: String,
+    site_default_remote: String,
+    site_concurrency: String,
+    site_charset: String,
+    /// 站点管理器右侧当前标签页（0=常规 1=高级 2=传输设置 3=字符集）。
+    site_tab: usize,
+    /// 当前载入到表单的站点名（用于「改名时删除旧条目」，避免残留孤儿站点）。
+    /// 新建站点或清空时置 None。
+    site_loaded_name: Option<String>,
     /// 从站点载入的远端目录：连接成功后落到这里（消费后清空）。
     pending_remote_dir: Option<String>,
 
@@ -157,6 +171,14 @@ pub struct RdepApp {
     edit_path: String,
     edit_content: String,
     edit_loaded: bool,
+
+    // 远端 chmod（右键「权限」触发）
+    show_chmod: bool,
+    chmod_path: String,
+    chmod_mode: String,
+    /// tail 编辑框自动滚动到末尾的触发标志：收到新日志行时置 true，
+    /// 渲染后清掉；与 tail_follow 叠加决定「是否滚到底」。
+    tail_view_dirty: bool,
 
     // 目录同步
     sync_local: String,
@@ -231,6 +253,15 @@ impl RdepApp {
             site_name_input: String::new(),
             site_remember_pass: false,
             show_sites: false,
+            cfg_login_type: "Normal".into(),
+            site_bg_color: "#1E90FF".into(),
+            site_comment: String::new(),
+            site_default_local: String::new(),
+            site_default_remote: String::new(),
+            site_concurrency: "2".into(),
+            site_charset: "Auto".into(),
+            site_tab: 0,
+            site_loaded_name: None,
             pending_remote_dir: None,
             new_dir: String::new(),
             rename_input: String::new(),
@@ -263,6 +294,10 @@ impl RdepApp {
             edit_path: String::new(),
             edit_content: String::new(),
             edit_loaded: false,
+            show_chmod: false,
+            chmod_path: String::new(),
+            chmod_mode: String::new(),
+            tail_view_dirty: false,
             sync_local: String::new(),
             sync_remote: "/opt/app".into(),
             sync_delete_extra: false,
@@ -462,6 +497,19 @@ impl RdepApp {
         }
     }
 
+    /// 远端 chmod（右键「权限」）。rdep 协议支持；SFTP/FTP 当前客户端构建未接 setstat，提示改用 rdep 站点。
+    fn do_chmod(&mut self, path: String, mode: u32) {
+        tracing::debug!(backend = ?self.backend, path = %path, mode = format!("{mode:o}"), "action: chmod");
+        if self.backend == Protocol::Rdep {
+            self.client.chmod(path, mode);
+        } else {
+            self.push_log(&tf(
+                "chmod requires the rdep protocol; current site is {p}, skipped",
+                &[("p", protocol_name(self.backend))],
+            ));
+        }
+    }
+
     fn do_sync_dir(&mut self, local: String, remote: String, delete_extra: bool, dry_run: bool) {
         tracing::debug!(backend = ?self.backend, local = %local, remote = %remote, delete_extra, dry_run, "action: sync dir");
         if self.backend == Protocol::Ftp {
@@ -500,6 +548,16 @@ impl RdepApp {
         let hint = tf("Connecting to {host}:{port} ...", &[("host", &host), ("port", &port)]);
         self.status = hint.clone();
         self.push_log(&hint);
+        // 应用站点里配置的默认目录（FileZilla 风格：连接后落到这里）
+        if !self.site_default_local.trim().is_empty() {
+            let p = PathBuf::from(self.site_default_local.trim());
+            if p.is_dir() {
+                self.local_dir = p;
+            }
+        }
+        if !self.site_default_remote.trim().is_empty() {
+            self.pending_remote_dir = Some(self.site_default_remote.trim().to_string());
+        }
         match self.backend {
             Protocol::Rdep => {
                 let p = self.params_from_form();
@@ -577,6 +635,27 @@ impl RdepApp {
             self.pending_remote_dir = Some(s.last_remote_dir.clone());
         }
         self.site_remember_pass = !s.password.is_empty();
+        self.site_loaded_name = Some(s.name.clone());
+        // FileZilla 风格字段
+        self.cfg_login_type = if s.login_type.is_empty() {
+            "Normal".into()
+        } else {
+            s.login_type.clone()
+        };
+        self.site_bg_color = if s.background_color.is_empty() {
+            "#1E90FF".into()
+        } else {
+            s.background_color.clone()
+        };
+        self.site_comment = s.comment.clone();
+        self.site_default_local = s.default_local_dir.clone();
+        self.site_default_remote = s.default_remote_dir.clone();
+        self.site_concurrency = s.concurrency.to_string();
+        self.site_charset = if s.charset.is_empty() {
+            "Auto".into()
+        } else {
+            s.charset.clone()
+        };
     }
 
     /// 把当前连接表单保存为一个站点（按站点名 upsert）。
@@ -585,6 +664,12 @@ impl RdepApp {
         if name.is_empty() {
             self.push_log(t("Enter a site name first"));
             return;
+        }
+        // 改名保护：若站点名相对载入时发生变化，删除旧条目，避免残留孤儿站点。
+        if let Some(old) = self.site_loaded_name.clone() {
+            if old != name && self.sites.iter().any(|s| s.name == old) {
+                let _ = self.store.remove(&old);
+            }
         }
         let password = if self.site_remember_pass {
             obfuscate_for_storage(&self.cfg_pass)
@@ -609,6 +694,13 @@ impl RdepApp {
             relay_token,
             last_remote_dir: self.remote_dir.clone(),
             use_token: self.cfg_use_token,
+            login_type: self.cfg_login_type.trim().to_string(),
+            background_color: self.site_bg_color.trim().to_string(),
+            comment: self.site_comment.trim().to_string(),
+            default_local_dir: self.site_default_local.trim().to_string(),
+            default_remote_dir: self.site_default_remote.trim().to_string(),
+            concurrency: self.site_concurrency.trim().parse().unwrap_or(2),
+            charset: self.site_charset.trim().to_string(),
         };
         match self.store.upsert(site) {
             Ok(()) => match self.store.load() {
@@ -651,6 +743,33 @@ impl RdepApp {
                 Err(e) => self.push_log(&format!("{}: {e:#}", t("Reload after delete failed"))),
             },
             Err(e) => self.push_log(&format!("{}: {e:#}", t("Failed to delete site"))),
+        }
+    }
+
+    /// 新建一个空白站点（立即落盘并在左侧树中选中），随后表单载入其默认值供编辑。
+    fn new_site(&mut self) {
+        let mut n = 1;
+        let mut name = format!("New site {n}");
+        while self.sites.iter().any(|s| s.name == name) {
+            n += 1;
+            name = format!("New site {n}");
+        }
+        let mut site = Site::blank();
+        site.name = name.clone();
+        if let Err(e) = self.store.upsert(site) {
+            self.push_log(&format!("{}: {e:#}", t("Failed to save site")));
+            return;
+        }
+        match self.store.load() {
+            Ok(v) => {
+                self.sites = v;
+                self.site_selected = self.sites.iter().position(|s| s.name == name);
+                if let Some(i) = self.site_selected {
+                    self.load_site_into_form(i);
+                }
+                self.push_log(&tf("created new site", &[("n", &name)]));
+            }
+            Err(e) => self.push_log(&format!("{}: {e:#}", t("Site written but reload failed"))),
         }
     }
 
@@ -847,6 +966,8 @@ impl RdepApp {
                     let drop = self.tail_view.len() - 200_000;
                     self.tail_view.drain(..drop);
                 }
+                // 标记内容已更新，tail 弹窗据此自动滚到底部
+                self.tail_view_dirty = true;
             }
             Event::TailDone { ok, message } => {
                 self.push_log(&format!(
@@ -1329,6 +1450,16 @@ impl RdepApp {
                 }
             });
         }
+        // ---- 远端 chmod：右键「权限」 ----
+        if name != ".." {
+            let target = join_remote(&self.remote_dir, &name);
+            if ui.button(t("Permissions")).clicked() {
+                self.chmod_path = target.clone();
+                self.chmod_mode.clear();
+                self.show_chmod = true;
+                ui.close_menu();
+            }
+        }
     }
 
     /// 右键上下文菜单：本地文件/目录。
@@ -1744,17 +1875,31 @@ impl RdepApp {
                     }
                 });
                 ui.separator();
+                // 自动滚动到末尾：跟随开启 或 收到新日志行（tail_view_dirty）时滚到底。
+                // 编辑框设为只读，避免其内部滚动吞掉滚轮、导致无法整体滚动。
+                let autoscroll = self.tail_follow || self.tail_view_dirty;
                 egui::ScrollArea::vertical()
                     .max_height(320.0)
                     .show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut self.tail_view)
                                 .desired_width(f32::INFINITY)
-                                .font(egui::TextStyle::Monospace),
+                                .font(egui::TextStyle::Monospace)
+                                .interactive(false),
                         );
+                        if autoscroll {
+                            ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                        }
                     });
+                self.tail_view_dirty = false;
             });
         self.show_tail = open;
+        // 窗口关闭时若仍在跟随，自动停止 follow（释放服务端 tail 资源）。
+        if !open && self.tail_follow {
+            self.do_stop_tail();
+            self.tail_follow = false;
+            self.push_log(t("tail stopped"));
+        }
     }
 
     /// GREP 弹出窗：在指定文件/目录中检索，结果在编辑框中。
@@ -1782,17 +1927,60 @@ impl RdepApp {
                     }
                 }
                 ui.separator();
+                // 结果逐行渲染：命中关键字（按 flags 取大小写）以红色高亮。
+                let pattern = self.grep_pattern.clone();
+                let ignore_case = self.grep_flags.contains('i');
                 egui::ScrollArea::vertical()
                     .max_height(300.0)
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.grep_view)
-                                .desired_width(f32::INFINITY)
-                                .font(egui::TextStyle::Monospace),
-                        );
+                        if self.grep_output.is_empty() {
+                            ui.label(t("(no output)"));
+                        } else {
+                            for line in &self.grep_output {
+                                render_grep_match(ui, line, &pattern, ignore_case);
+                            }
+                        }
                     });
             });
         self.show_grep = open;
+    }
+
+    /// chmod 弹窗（右键「权限」触发）：填远端路径与八进制权限，点「应用」下发。
+    fn chmod_dialog(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_chmod;
+        let mut close = false;
+        egui::Window::new(t("Permissions"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                labeled(ui, t("Remote file"), &mut self.chmod_path);
+                ui.horizontal(|ui| {
+                    ui.label(t("Octal mode (e.g. 0644)"));
+                    ui.text_edit_singleline(&mut self.chmod_mode);
+                });
+                ui.horizontal(|ui| {
+                    if ui.button(t("Apply")).clicked() {
+                        let p = self.chmod_path.trim().to_string();
+                        let m = self.chmod_mode.trim();
+                        if p.is_empty() {
+                            self.push_log(t("Remote path is required"));
+                        } else {
+                                match parse_octal_mode(m) {
+                                    Some(mode) => {
+                                        self.do_chmod(p, mode);
+                                        close = true;
+                                    }
+                                    None => self.push_log(t("invalid octal mode")),
+                                }
+                        }
+                    }
+                    if ui.button(t("Cancel")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        self.show_chmod = open && !close;
     }
 
     /// 远端文件编辑窗：加载 → 编辑 → 保存（服务端保存前自动备份）。
@@ -1840,79 +2028,278 @@ impl RdepApp {
     }
 
     /// 站点管理器：列出已保存站点 / 保存当前配置 / 删除 / 双击载入到连接表单。
+    /// 站点管理器（FileZilla 风格）：左侧站点树 + 右侧标签页（常规/高级/传输设置/字符集）。
+    /// 所有字段（协议、登录类型、背景颜色、注释、默认本地/远端目录、并发数、字符集）随
+    /// 「确定」实时写入 `sites.json`，连接时按站点配置落到对应默认目录。
     fn sites_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_sites;
+        let mut close = false;
+        let backend_before = self.backend;
         egui::Window::new(t("Site manager"))
             .open(&mut open)
             .collapsible(false)
-            .default_width(460.0)
+            .default_width(780.0)
+            .default_height(540.0)
             .show(ctx, |ui| {
                 ui.label(format!("{} {}", t("Config file:"), self.store.path().display()));
                 ui.separator();
 
-                if self.sites.is_empty() {
-                    ui.label(t("No saved sites yet. Fill in the connect window and click \"Save site\"."));
-                } else {
-                    let mut to_load: Option<usize> = None;
-                    egui::ScrollArea::vertical()
-                        .max_height(180.0)
-                        .show(ui, |ui| {
-                            for (i, s) in self.sites.iter().enumerate() {
-                                let selected = self.site_selected == Some(i);
-                                let has_pass = !s.password.is_empty();
-                                let label = format!(
-                                    "[{}] {}  {}:{}{}",
-                                    protocol_name(s.protocol),
-                                    s.display(),
-                                    s.host,
-                                    s.port,
-                                    if has_pass { "  🔑" } else { "" }
-                                );
-                                let resp = ui.selectable_label(selected, label);
-                                if resp.clicked() {
-                                    self.site_selected = Some(i);
-                                }
-                                if resp.double_clicked() {
-                                    to_load = Some(i);
-                                }
-                            }
-                        });
-                    if let Some(i) = to_load {
-                        self.load_site_into_form(i);
-                        self.show_connect = true;
-                        self.push_log(t("Site loaded into connect window"));
-                    }
-
-                    ui.horizontal(|ui| {
-                        if ui.button(t("Load to connect window")).clicked() {
-                            if let Some(i) = self.site_selected {
-                                self.load_site_into_form(i);
-                                self.show_connect = true;
-                                self.push_log(t("Site loaded into connect window"));
-                            } else {
-                                self.push_log(t("Choose a site first"));
-                            }
+                ui.horizontal(|ui| {
+                    // ===== 左侧：站点树 =====
+                    ui.vertical(|ui| {
+                        ui.set_min_width(210.0);
+                        ui.set_max_width(210.0);
+                        ui.heading(t("My Sites"));
+                        if ui.button(t("New site")).clicked() {
+                            self.new_site();
                         }
-                        if ui.button(t("Delete selected")).clicked() {
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .max_height(380.0)
+                            .show(ui, |ui| {
+                                let mut clicked: Option<usize> = None;
+                                egui::CollapsingHeader::new(t("My Sites"))
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        for (i, s) in self.sites.iter().enumerate() {
+                                            let selected = self.site_selected == Some(i);
+                                            if ui
+                                                .selectable_label(selected, s.display())
+                                                .clicked()
+                                            {
+                                                self.site_selected = Some(i);
+                                                clicked = Some(i);
+                                            }
+                                        }
+                                        if self.sites.is_empty() {
+                                            ui.colored_label(
+                                                egui::Color32::from_gray(150),
+                                                t("No saved sites yet; click \"New site\"."),
+                                            );
+                                        }
+                                    });
+                                if let Some(i) = clicked {
+                                    self.load_site_into_form(i);
+                                }
+                            });
+                        ui.separator();
+                        if ui.button(t("Delete")).clicked() {
                             self.delete_selected_site();
                         }
                     });
-                }
+
+                    ui.separator();
+
+                    // ===== 右侧：详情 + 标签页 =====
+                    ui.vertical(|ui| {
+                        ui.set_min_width(520.0);
+                        let title = match self.site_selected {
+                            Some(i) => self
+                                .sites
+                                .get(i)
+                                .map(|s| s.display())
+                                .unwrap_or_else(|| t("(new site)").to_string()),
+                            None => t("(new site)").to_string(),
+                        };
+                        // 站点名（可改名；保存时按新名 upsert，旧名自动删除）
+                        ui.horizontal(|ui| {
+                            ui.label(t("Site name"));
+                            ui.text_edit_singleline(&mut self.site_name_input);
+                        });
+                        ui.heading(title);
+
+                        // 标签页切换条
+                        ui.horizontal(|ui| {
+                            let tabs = [
+                                t("General"),
+                                t("Advanced"),
+                                t("Transfer Settings"),
+                                t("Charset"),
+                            ];
+                            for (i, label) in tabs.iter().enumerate() {
+                                if ui
+                                    .selectable_label(self.site_tab == i, *label)
+                                    .clicked()
+                                {
+                                    self.site_tab = i;
+                                }
+                            }
+                        });
+                        ui.separator();
+
+                        egui::ScrollArea::vertical()
+                            .max_height(330.0)
+                            .show(ui, |ui| match self.site_tab {
+                                0 => self.site_tab_general(ui),
+                                1 => self.site_tab_advanced(ui),
+                                2 => self.site_tab_transfer(ui),
+                                3 => self.site_tab_charset(ui),
+                                _ => {}
+                            });
+                    });
+                });
 
                 ui.separator();
-                ui.label(t("Save current form as site:"));
                 ui.horizontal(|ui| {
-                    ui.label(t("Site name"));
-                    ui.text_edit_singleline(&mut self.site_name_input);
-                });
-                ui.checkbox(&mut self.site_remember_pass, t("Remember password"));
-                ui.horizontal(|ui| {
-                    if ui.button(t("Save site")).clicked() {
+                    if ui.button(t("Connect")).clicked() {
                         self.save_current_form_as_site();
+                        self.connect_via_current_backend();
+                        close = true;
+                    }
+                    if ui.button(t("OK")).clicked() {
+                        self.save_current_form_as_site();
+                        close = true;
+                    }
+                    if ui.button(t("Cancel")).clicked() {
+                        close = true;
                     }
                 });
             });
-        self.show_sites = open;
+
+        // 切换协议时同步端口到该协议默认值（避免残留上一协议端口）
+        if self.backend != backend_before {
+            sync_port_to_protocol(self);
+        }
+        self.show_sites = open && !close;
+    }
+
+    /// 常规标签页：协议 / 主机 / 端口 / 登录类型 / 用户·密码 / CA / 中转 / 标签颜色 / 注释。
+    fn site_tab_general(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(t("Protocol"));
+            egui::ComboBox::from_id_salt("site_proto")
+                .selected_text(self.backend.label())
+                .show_ui(ui, |ui| {
+                    for p in [Protocol::Rdep, Protocol::Ftp, Protocol::Sftp] {
+                        ui.selectable_value(&mut self.backend, p, p.label());
+                    }
+                });
+        });
+        if !self.backend.supports_advanced() {
+            ui.colored_label(
+                egui::Color32::from_gray(140),
+                t("FTP only supports basic file operations; publish/rollback, directory sync, tail/grep, edit, resume and relay are rdep-only. FTP is plaintext."),
+            );
+        }
+        if self.backend == Protocol::Sftp {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 40),
+                t("SFTP: publish/rollback require the rdep service and are unavailable."),
+            );
+        }
+        labeled(ui, t("Host"), &mut self.cfg_host);
+        labeled(ui, t("Port"), &mut self.cfg_port);
+        // 登录类型
+        ui.horizontal(|ui| {
+            ui.label(t("Logon type"));
+            let lbl = match self.cfg_login_type.as_str() {
+                "Key" => t("Key file (SSH)"),
+                "Ask" => t("Ask for password each time"),
+                _ => t("Normal (user & password)"),
+            };
+            egui::ComboBox::from_id_salt("site_login")
+                .selected_text(lbl)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.cfg_login_type,
+                        "Normal".into(),
+                        t("Normal (user & password)"),
+                    );
+                    ui.selectable_value(
+                        &mut self.cfg_login_type,
+                        "Key".into(),
+                        t("Key file (SSH)"),
+                    );
+                    ui.selectable_value(
+                        &mut self.cfg_login_type,
+                        "Ask".into(),
+                        t("Ask for password each time"),
+                    );
+                });
+        });
+        // 「每次询问」登录类型时不保存密码
+        if self.cfg_login_type != "Ask" {
+            labeled(ui, t("User"), &mut self.cfg_user);
+            ui.horizontal(|ui| {
+                ui.label(t("Password"));
+                ui.add(egui::TextEdit::singleline(&mut self.cfg_pass).password(true));
+            });
+            ui.checkbox(&mut self.site_remember_pass, t("Remember password"));
+        }
+        labeled(ui, t("CA cert path"), &mut self.cfg_ca);
+        // rdep 专属：经 forwarder 中转
+        if self.backend == Protocol::Rdep {
+            ui.checkbox(&mut self.cfg_use_forwarder, t("Relay via forwarder"));
+            if self.cfg_use_forwarder {
+                labeled(ui, t("Target service id"), &mut self.cfg_service_id);
+                labeled(ui, t("Relay token"), &mut self.cfg_relay_token);
+                ui.label(t("Tip: host/port are the forwarder address"));
+            }
+        }
+        // FileZilla 风格：标签颜色 + 注释
+        ui.horizontal(|ui| {
+            ui.label(t("Background color"));
+            ui.text_edit_singleline(&mut self.site_bg_color);
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+            if let Ok(c) = parse_hex_color(&self.site_bg_color) {
+                ui.painter().rect_filled(rect, egui::Rounding::same(3.0), c);
+            }
+        });
+        labeled(ui, t("Comment"), &mut self.site_comment);
+    }
+
+    /// 高级标签页：默认本地目录（浏览=填入当前本地目录）/ 默认远端目录。
+    fn site_tab_advanced(&mut self, ui: &mut egui::Ui) {
+        ui.label(t("Default local directory"));
+        ui.horizontal(|ui| {
+            ui.text_edit_singleline(&mut self.site_default_local);
+            if ui.button(t("Browse...")).clicked() {
+                self.site_default_local = self.local_dir.to_string_lossy().into_owned();
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button(t("Use current local directory")).clicked() {
+                self.site_default_local = self.local_dir.to_string_lossy().into_owned();
+            }
+        });
+        ui.separator();
+        labeled(ui, t("Default remote directory"), &mut self.site_default_remote);
+        ui.label(t("Connection opens directly into these directories"));
+    }
+
+    /// 传输设置标签页：并发传输数。
+    fn site_tab_transfer(&mut self, ui: &mut egui::Ui) {
+        let mut n = self.site_concurrency.trim().parse::<u8>().unwrap_or(2);
+        ui.horizontal(|ui| {
+            ui.label(t("Concurrent transfers"));
+            ui.add(
+                egui::DragValue::new(&mut n)
+                    .range(1..=16)
+                    .clamp_existing_to_range(true)
+                    .suffix(""),
+            );
+        });
+        self.site_concurrency = n.to_string();
+        ui.label(t("Tip: higher concurrency speeds up many small files."));
+    }
+
+    /// 字符集标签页：Auto / 强制 UTF-8。
+    fn site_tab_charset(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(t("Charset"));
+            egui::ComboBox::from_id_salt("site_charset")
+                .selected_text(self.site_charset.clone())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.site_charset, "Auto".into(), t("Auto"));
+                    ui.selectable_value(
+                        &mut self.site_charset,
+                        "UTF-8".into(),
+                        t("Force UTF-8"),
+                    );
+                });
+        });
+        ui.label(t("Auto follows the server; UTF-8 forces encoding"));
     }
 
     fn connect_window(&mut self, ctx: &egui::Context) {
@@ -1987,12 +2374,7 @@ impl RdepApp {
             });
         // 切换协议时把端口切到该协议默认值，避免残留上一个协议的端口
         if self.backend != backend_before {
-            self.cfg_port = match self.backend {
-                Protocol::Rdep => "8443",
-                Protocol::Ftp => "21",
-                Protocol::Sftp => "22",
-            }
-            .to_string();
+            sync_port_to_protocol(self);
         }
         // 注意：不能用 `self.show_connect = open` 直接覆盖——闭包内已请求关闭时
         // open 仍是进入本帧前的旧值，会把关闭请求吞掉（表现为按钮“没反应”）。
@@ -2100,12 +2482,7 @@ impl RdepApp {
             });
             if self.backend != qc_backend_before {
                 // 与连接对话框一致：切换协议时自动切默认端口
-                self.cfg_port = match self.backend {
-                    Protocol::Rdep => "8443",
-                    Protocol::Ftp => "21",
-                    Protocol::Sftp => "22",
-                }
-                .to_string();
+                sync_port_to_protocol(self);
             }
         });
 
@@ -2138,6 +2515,9 @@ impl RdepApp {
         if self.show_edit {
             self.edit_dialog(ctx);
         }
+        if self.show_chmod {
+            self.chmod_dialog(ctx);
+        }
 
         ctx.request_repaint_after(Duration::from_millis(50));
     }
@@ -2165,11 +2545,95 @@ fn protocol_name(p: Protocol) -> &'static str {
     }
 }
 
+/// 协议对应的默认端口（站点管理器与连接框切换协议时回填端口用）。
+fn default_port_for_protocol(p: Protocol) -> &'static str {
+    match p {
+        Protocol::Rdep => "8443",
+        Protocol::Ftp => "21",
+        Protocol::Sftp => "22",
+    }
+}
+
+/// 切换协议时把端口切到该协议默认值（避免残留上一个协议的端口）。
+fn sync_port_to_protocol(app: &mut RdepApp) {
+    app.cfg_port = default_port_for_protocol(app.backend).to_string();
+}
+
 fn labeled(ui: &mut egui::Ui, name: &str, s: &mut String) {
     ui.horizontal(|ui| {
         ui.label(name);
         ui.text_edit_singleline(s);
     });
+}
+
+/// 解析八进制权限串（如 `0644` / `644`），返回 0..=0o7777 内的数值；非法返回 None。
+fn parse_octal_mode(s: &str) -> Option<u32> {
+    let v = u32::from_str_radix(s.trim(), 8).ok()?;
+    if (0..=0o7777).contains(&v) {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// 解析 `#RRGGBB`（或 `RRGGBB`）十六进制颜色；非法返回 Err。
+fn parse_hex_color(s: &str) -> Result<egui::Color32, ()> {
+    let s = s.trim_start_matches('#');
+    if s.len() == 6 {
+        if let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&s[0..2], 16),
+            u8::from_str_radix(&s[2..4], 16),
+            u8::from_str_radix(&s[4..6], 16),
+        ) {
+            return Ok(egui::Color32::from_rgb(r, g, b));
+        }
+    }
+    Err(())
+}
+
+/// 渲染一行 grep 结果：所有命中 `pattern` 的子串用红色高亮，其余用常规文本色。
+/// `ignore_case` 为真时按小写匹配（仅当大小写折叠不改变字节长度，避免越界）。
+fn render_grep_match(ui: &mut egui::Ui, line: &str, pattern: &str, ignore_case: bool) {
+    if pattern.is_empty() {
+        ui.label(egui::RichText::new(line).font(egui::FontId::monospace(12.0)));
+        return;
+    }
+    let hay = if ignore_case { line.to_lowercase() } else { line.to_string() };
+    let needle = if ignore_case { pattern.to_lowercase() } else { pattern.to_string() };
+    // 大小写折叠改变了字节长度（非 ASCII）时放弃高亮，避免按偏移切片越界 panic。
+    if hay.len() != line.len() || needle.is_empty() {
+        ui.label(egui::RichText::new(line).font(egui::FontId::monospace(12.0)));
+        return;
+    }
+    let base = ui.style().visuals.text_color();
+    let red = egui::Color32::RED;
+    let mut job = egui::text::LayoutJob::default();
+    let mut start = 0;
+    while let Some(r) = hay[start..].find(&needle) {
+        let ms = start + r;
+        let me = ms + needle.len();
+        if ms > start {
+            job.append(
+                &line[start..ms],
+                0.0,
+                egui::TextFormat::simple(egui::FontId::monospace(12.0), base),
+            );
+        }
+        job.append(
+            &line[ms..me],
+            0.0,
+            egui::TextFormat::simple(egui::FontId::monospace(12.0), red),
+        );
+        start = me;
+    }
+    if start < line.len() {
+        job.append(
+            &line[start..],
+            0.0,
+            egui::TextFormat::simple(egui::FontId::monospace(12.0), base),
+        );
+    }
+    ui.label(job);
 }
 
 /// 本地文件权限位（unix；非 unix 返回 0）。
@@ -2572,5 +3036,174 @@ mod gui_smoke {
         assert_eq!(join_remote("/", "a.txt"), "/a.txt");
         assert_eq!(join_remote("/opt", "a.txt"), "/opt/a.txt");
         assert_eq!(join_remote("/opt/", "sub/a.txt"), "/opt/sub/a.txt");
+    }
+
+    /// FileZilla 风格站点字段（登录类型/背景色/注释/默认目录/并发/字符集）必须能
+    /// 通过保存链路落到 sites.json，并从磁盘重载后保持一致。
+    #[test]
+    fn site_manager_persists_new_fields() {
+        let mut app = test_app("sitefields");
+        app.show_connect = true;
+        app.backend = Protocol::Sftp; // 三种协议之一，验证协议字段被保存
+        app.site_name_input = "demo".into();
+        app.cfg_host = "192.168.1.10".into();
+        app.cfg_port = "22".into();
+        app.cfg_user = "ops".into();
+        app.cfg_pass = "secret".into();
+        app.site_remember_pass = true;
+        app.cfg_login_type = "Key".into();
+        app.site_bg_color = "#1E90FF".into();
+        app.site_comment = "prod edge node".into();
+        app.site_default_local = "/data/in".into();
+        app.site_default_remote = "/opt/app".into();
+        app.site_concurrency = "4".into();
+        app.site_charset = "UTF-8".into();
+
+        app.save_current_form_as_site();
+        // 从磁盘重载，确认落盘
+        let reloaded = app.store.load().expect("reload sites");
+        assert_eq!(reloaded.len(), 1, "应保存 1 个站点");
+        let s = &reloaded[0];
+        assert_eq!(s.name, "demo");
+        assert_eq!(s.protocol, Protocol::Sftp, "协议字段应被保存");
+        assert_eq!(s.login_type, "Key", "登录类型应被保存");
+        assert_eq!(s.background_color, "#1E90FF", "背景色应被保存");
+        assert_eq!(s.comment, "prod edge node", "注释应被保存");
+        assert_eq!(s.default_local_dir, "/data/in", "默认本地目录应被保存");
+        assert_eq!(s.default_remote_dir, "/opt/app", "默认远端目录应被保存");
+        assert_eq!(s.concurrency, 4, "并发数应被保存");
+        assert_eq!(s.charset, "UTF-8", "字符集应被保存");
+        // 勾选记住密码后，密码应以混淆形式落盘（非明文）
+        assert!(!s.password.is_empty(), "记住密码时应有存储内容");
+        assert_ne!(s.password, "secret", "密码不得以明文落盘");
+
+        // 重载进表单也应还原新字段
+        app.site_selected = Some(0);
+        app.load_site_into_form(0);
+        assert_eq!(app.cfg_login_type, "Key");
+        assert_eq!(app.site_bg_color, "#1E90FF");
+        assert_eq!(app.site_default_remote, "/opt/app");
+        assert_eq!(app.site_concurrency, "4");
+        assert_eq!(app.site_charset, "UTF-8");
+    }
+
+    /// 站点管理器：打开窗口并渲染若干帧（含三种协议 + 标签页切换）不应 panic。
+    #[test]
+    fn sites_window_renders_all_protocols_and_tabs() {
+        let mut app = test_app("sitesrender");
+        app.sites = vec![
+            Site {
+                name: "rdep-site".into(),
+                protocol: Protocol::Rdep,
+                host: "h1".into(),
+                ..Default::default()
+            },
+            Site {
+                name: "ftp-site".into(),
+                protocol: Protocol::Ftp,
+                host: "h2".into(),
+                ..Default::default()
+            },
+            Site {
+                name: "sftp-site".into(),
+                protocol: Protocol::Sftp,
+                host: "h3".into(),
+                ..Default::default()
+            },
+        ];
+        app.site_selected = Some(0);
+        app.load_site_into_form(0);
+        app.show_sites = true;
+        render(&mut app, 3);
+
+        // 切到高级 / 传输 / 字符集 三个标签页分别渲染
+        for tab in 1..=3 {
+            app.site_tab = tab;
+            render(&mut app, 2);
+        }
+        // 切换到 FTP 站点后回填默认端口（与连接框一致的逻辑）
+        app.backend = Protocol::Ftp;
+        sync_port_to_protocol(&mut app);
+        assert_eq!(app.cfg_port, "21", "切到 FTP 应回填端口 21");
+        app.backend = Protocol::Sftp;
+        sync_port_to_protocol(&mut app);
+        assert_eq!(app.cfg_port, "22", "切到 SFTP 应回填端口 22");
+        app.backend = Protocol::Rdep;
+        sync_port_to_protocol(&mut app);
+        assert_eq!(app.cfg_port, "8443", "切到 rdep 应回填端口 8443");
+        render(&mut app, 2);
+    }
+
+    /// tail：收到新日志行应置 dirty 触发自动滚动；渲染 tail 弹窗后 dirty 被清零。
+    #[test]
+    fn tail_dirty_flag_set_by_new_line_and_reset_after_render() {
+        let mut app = test_app("taildirty");
+        assert!(!app.tail_view_dirty, "初始未脏");
+        app.handle(Event::TailLine { line: "new line".into() });
+        assert!(app.tail_view_dirty, "新日志行应置 dirty");
+
+        app.show_tail = true;
+        render(&mut app, 2);
+        assert!(!app.tail_view_dirty, "渲染后应清零 dirty（已滚到底）");
+    }
+
+    /// grep：带 pattern 渲染结果窗时，命中高亮分支不应 panic（含大小写不敏感）。
+    #[test]
+    fn grep_highlight_renders_with_pattern() {
+        let mut app = test_app("grephl");
+        app.show_grep = true;
+        app.grep_pattern = "error".into();
+        app.grep_flags = "in".into(); // 忽略大小写 + 行号
+        app.grep_output = vec![
+            "main.rs:12:ERROR something".into(),
+            "lib.rs:30:no match here".into(),
+        ];
+        render(&mut app, 3);
+    }
+
+    /// chmod 按钮：rdep 走 client.chmod（不 panic）；非 rdep 协议应给出明确拦截日志。
+    #[test]
+    fn chmod_gating_rdep_vs_ftp() {
+        let mut app = test_app("chmodgate");
+
+        app.backend = Protocol::Rdep;
+        let before = app.log.len();
+        app.do_chmod("/opt/app/x".into(), 0o644);
+        assert_eq!(app.log.len(), before, "rdep 不应拦截 chmod（无额外日志）");
+
+        app.backend = Protocol::Ftp;
+        app.do_chmod("/opt/app/x".into(), 0o644);
+        let last = app.log.last().cloned().unwrap_or_default();
+        assert!(
+            last.contains("rdep protocol"),
+            "非 rdep 应提示需 rdep 协议: {last}"
+        );
+    }
+
+    /// 八进制权限解析：合法串 -> Some；非法串 -> None；范围越界 -> None。
+    #[test]
+    fn parse_octal_mode_cases() {
+        assert_eq!(parse_octal_mode("0644"), Some(0o644));
+        assert_eq!(parse_octal_mode("755"), Some(0o755));
+        assert_eq!(parse_octal_mode(" 600 "), Some(0o600));
+        assert_eq!(parse_octal_mode("8"), None, "8 非八进制");
+        assert_eq!(parse_octal_mode("abc"), None, "字母非法");
+        assert_eq!(parse_octal_mode("10000"), None, "超出 0o7777");
+        assert_eq!(parse_octal_mode("-1"), None, "负数非法");
+    }
+
+    /// 右键「权限」应弹出 chmod 窗口并预填远端路径。
+    #[test]
+    fn remote_context_menu_opens_permissions() {
+        let mut app = test_app("ctxperm");
+        app.backend = Protocol::Rdep;
+        app.remote_dir = "/opt".into();
+        app.remote_entries = vec![entry("app.conf", false, 100, 0o644)];
+        // 模拟右键菜单里点「权限」按钮：直接驱动等价逻辑
+        app.chmod_path = "/opt/app.conf".into();
+        app.chmod_mode.clear();
+        app.show_chmod = true;
+        render(&mut app, 2);
+        assert!(app.show_chmod, "chmod 窗口应处于打开状态");
     }
 }

@@ -281,6 +281,11 @@ pub enum CmdType {
     /// 备份库位于 service 的私有工作目录（meta），**不在部署根之下**，
     /// 因此无法用 `Ls /backup` 取得（早期实现靠 ls 猜路径，备份位置一变就失效）。
     Backups,
+    /// 远端 `chmod`：在目标文件/目录上设置 unix 权限位（在 service 端校验路径后在 root 内执行）。
+    ///
+    /// 用于 GUI 右键「权限」按钮：用户在弹窗输入八进制权限（如 `0755`），
+    /// 经本指令下发给 service 执行，service 用 `std::fs::set_permissions` 落地。
+    Chmod,
 }
 
 impl CmdType {
@@ -303,6 +308,7 @@ impl CmdType {
             15 => CmdType::Ping,
             16 => CmdType::PublishCommit,
             17 => CmdType::Backups,
+            18 => CmdType::Chmod,
             _ => return Err(Error::UnknownCommand(v)),
         })
     }
@@ -489,6 +495,19 @@ pub struct DownloadRequest {
     pub policy: NamePolicy,
 }
 
+/// 下载应答体：除整文件 sha256（用于落盘校验）外，还携带远端文件的
+/// **权限位**与**修改时间**，便于客户端把这两个属性「原样」还原到本地文件，
+/// 实现「下载后文件属性/时间与远端一致」。
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DownloadResponse {
+    /// unix `st_mode & 0o777`；0 表示服务端未提供（非 unix / 未知），客户端保持默认。
+    pub mode: u32,
+    /// 远端文件 mtime（秒，Unix epoch）；0 表示未知。
+    pub mtime: i64,
+    /// 整文件 SHA-256（落盘后校验完整性）。
+    pub sha256: [u8; 32],
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TailRequest {
     pub path: String,
@@ -545,6 +564,13 @@ pub struct MoveRequest {
 pub struct RenameRequest {
     pub src: String,
     pub new_name: String,
+}
+
+/// 远端 `chmod` 请求：在 `path` 上设置权限位 `mode`（unix `st_mode & 0o777`）。
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChmodRequest {
+    pub path: String,
+    pub mode: u32,
 }
 
 // ===========================================================================

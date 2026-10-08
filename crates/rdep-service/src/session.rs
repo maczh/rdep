@@ -5,11 +5,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rdep_protocol::{
-    AuthMethod, AuthRequest, AuthResponse, BackupsResponse, CmdRequest, CmdResponse, CmdType, CopyPolicy,
-    CopyRequest, Ctrl, DataChunk, DeleteRequest, DownloadRequest, EditRequest, ErrorCode, Frame,
-    FrameFlags, FrameType, GrepRequest, GrepResponse, LsRequest, MkdirRequest, MoveRequest,
-    PublishCommitRequest, PublishRequest, RenameRequest, RollbackRequest, StreamPush, TailRequest,
-    UploadCommit, UploadInit, UploadInitAck, sha256, CHUNK_SIZE_DEFAULT,
+    AuthMethod, AuthRequest, AuthResponse, BackupsResponse, ChmodRequest, CmdRequest, CmdResponse,
+    CmdType, CopyPolicy, CopyRequest, Ctrl, DataChunk, DeleteRequest, DownloadRequest, DownloadResponse,
+    EditRequest, ErrorCode, Frame, FrameFlags, FrameType, GrepRequest, GrepResponse, LsRequest,
+    MkdirRequest, MoveRequest, PublishCommitRequest, PublishRequest, RenameRequest, RollbackRequest,
+    StreamPush, TailRequest, UploadCommit, UploadInit, UploadInitAck, sha256, CHUNK_SIZE_DEFAULT,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -31,6 +31,8 @@ struct ActiveUpload {
     file_sha256: [u8; 32],
     /// 落盘后要应用的权限位（0 = 默认）。
     mode: u32,
+    /// 落盘后要把 mtime 设回的 Unix 秒（0 = 不设置，保持写入时间）。
+    mtime: i64,
 }
 
 /// 一次发布（发布=多文件带备份上传 + 收尾重启脚本）的进行中状态。
@@ -336,6 +338,7 @@ where
                     total_chunks: init.total_chunks,
                     file_sha256: init.file_sha256,
                     mode: init.mode,
+                    mtime: init.mtime,
                 };
                 uploads.insert(init.transfer_id, au);
                 let body = postcard::to_allocvec(&UploadInitAck { received })?;
@@ -412,6 +415,10 @@ where
                         if let Err(e) = storage.apply_mode(&dest, au.mode) {
                             tracing::warn!(peer, dest = %dest.display(), "upload commit: apply mode failed: {e:#}");
                         }
+                        // 落盘后恢复 mtime（让部署后文件时间与原文件一致）
+                        if let Err(e) = storage.set_mtime(&au.remote_path, au.mtime) {
+                            tracing::warn!(peer, path = %au.remote_path, mtime = au.mtime, "upload commit: set mtime failed: {e:#}");
+                        }
                         storage.cleanup_staging(commit.transfer_id);
                         if let Some(p) = publish.as_mut() {
                             p.completed += 1;
@@ -451,8 +458,8 @@ where
                 }
             };
             tracing::debug!(peer, path = %dr.remote_path, "download: request");
-            let data = match storage.read_file(&dr.remote_path) {
-                Ok(d) => d,
+            let (data, mode, mtime) = match storage.read_file_meta(&dr.remote_path) {
+                Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(peer, path = %dr.remote_path, "download: read failed: {e:#}");
                     return Ok(Some(make_response(
@@ -476,10 +483,15 @@ where
                 );
                 codec.write_frame(&f).await?;
             }
-            tracing::debug!(peer, path = %dr.remote_path, bytes = data.len(), chunks = n, "download: streamed");
-            // 响应体带文件 sha256，client 落盘后可校验完整性
+            tracing::debug!(peer, path = %dr.remote_path, bytes = data.len(), chunks = n, mode, mtime, "download: streamed");
+            // 响应体带文件 sha256 + 权限位 + mtime，client 落盘后还原属性/时间
             let sha = sha256(&data);
-            Ok(Some(make_response(req, true, ErrorCode::Ok, "", sha.to_vec())))
+            let body = postcard::to_allocvec(&DownloadResponse {
+                mode,
+                mtime,
+                sha256: sha,
+            })?;
+            Ok(Some(make_response(req, true, ErrorCode::Ok, "", body)))
         }
 
         CmdType::Delete => {
@@ -889,10 +901,34 @@ where
             Ok(Some(make_response(req, true, ErrorCode::Ok, "", body)))
         }
 
-        CmdType::Ping => {
-            tracing::trace!(peer, seq = req.seq, "ping request");
-            Ok(Some(make_response(req, true, ErrorCode::Ok, "", vec![])))
-        },
+            CmdType::Chmod => {
+                let cr: ChmodRequest = match postcard::from_bytes(&req.body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(peer, "chmod: body decode failed: {e}");
+                        return Err(e.into());
+                    }
+                };
+                tracing::debug!(peer, path = %cr.path, mode = format!("{:o}", cr.mode), "chmod: request");
+                match storage.chmod(&cr.path, cr.mode) {
+                    Ok(()) => Ok(Some(make_response(req, true, ErrorCode::Ok, "", vec![]))),
+                    Err(e) => {
+                        tracing::warn!(peer, path = %cr.path, "chmod: failed: {e:#}");
+                        Ok(Some(make_response(
+                            req,
+                            false,
+                            ErrorCode::PermissionDenied,
+                            &format!("chmod failed: {e:#}"),
+                            vec![],
+                        )))
+                    }
+                }
+            }
+
+            CmdType::Ping => {
+                tracing::trace!(peer, seq = req.seq, "ping request");
+                Ok(Some(make_response(req, true, ErrorCode::Ok, "", vec![])))
+            },
     }
 }
 

@@ -1621,6 +1621,7 @@ fn site_saved_drives_connection_e2e() {
             relay_token: String::new(),
             last_remote_dir: "/myproj".into(),
             use_token: false,
+            ..Default::default()
         })
         .expect("save site");
 
