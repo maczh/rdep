@@ -37,4 +37,14 @@ fn sftp_live_connect_localhost() {
         "30s 内未收到任何事件——连接静默挂起（这就是 GUI 无响应的复现）"
     );
     assert!(evs.iter().any(|e| matches!(e, Event::Connected | Event::Error(_))));
+
+    // 连通后顺带验证 chmod（SFTP setstat）往返：发出 OpDone 即代表协议链路通
+    if evs.iter().any(|e| matches!(e, Event::Connected)) {
+        c.chmod("/tmp/rdep-chmod-probe".into(), 0o600);
+        let chmod_evs = drain(&c, 5);
+        assert!(
+            chmod_evs.iter().any(|e| matches!(e, Event::OpDone { .. })),
+            "chmod 后未收到 OpDone 事件（setstat 链路未通）"
+        );
+    }
 }

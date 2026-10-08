@@ -90,10 +90,11 @@ Phase0 ─► Phase1 ─► Phase2 ─► Phase3 ─► Phase4
    - 上传：`set_mtime`（`std::fs::set_times`）+ `apply_mode` 保留 mtime 与权限位。
    - 下载：`DownloadResponse{mode, mtime, sha256}` 带回属性，client 侧 `apply_local_mode`/`apply_local_mtime` 还原。
 
-6. **右键「权限」→ 远程 chmod（rdep only）**
+6. **右键「权限」→ 远程 chmod（rdep + SFTP）**
    - 远程文件右键菜单新增「Permissions」按钮 → `chmod_dialog` 输入八进制模式（0–0o7777 校验）。
-   - 协议层 `CmdType::Chmod` / `ChmodRequest{path,mode}`、service `storage::chmod`、client `Client::chmod` 全链路打通。
-   - 因高版 SFTP `SftpSession` 无 `setstat`，chmod 仅 rdep 协议支持；ftp/sftp 点击时给出明确提示「requires the rdep protocol...」。
+   - rdep：协议层 `CmdType::Chmod` / `ChmodRequest{path,mode}`、service `storage::chmod`、client `Client::chmod` 全链路打通。
+   - SFTP：经 `SftpSession::set_metadata`（`SSH_FXP_SETSTAT`，底层 `setstat`）实现，属性只设 `permissions` 不误清空 size/mtime。
+   - FTP 协议无标准 chmod，仍不支持；点击时日志提示「chmod not supported over FTP...」。
 
 - **验证**：`cargo test -p rdep-protocol -p rdep-service -p rdep-client`（lib 76 + integration 18 全绿）；
   `cargo clippy --all-targets` 无 error。新增/增强单测覆盖：站点字段往返、grep 标红渲染、tail 脏标记、

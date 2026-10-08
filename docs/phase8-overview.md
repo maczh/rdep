@@ -12,7 +12,7 @@
 | 3 | grep 命中内容标红 | `render_grep_match`（`LayoutJob` 红色逐段） | ✅ |
 | 4 | 编辑保存先备份原文件再覆盖原文件名 | `rdep-service/src/storage.rs` `save_with_backup` | ✅ |
 | 5 | 上传/下载保留 mode + mtime | service `set_mtime`/`apply_mode`；`DownloadResponse{mode,mtime,sha256}`；client `apply_local_*` | ✅ |
-| 6 | 右键「权限」→ 远程 chmod（rdep only） | `CmdType::Chmod` / `storage::chmod` / `Client::chmod` / `chmod_dialog` | ✅ |
+| 6 | 右键「权限」→ 远程 chmod（rdep + SFTP） | rdep: `CmdType::Chmod`/`storage::chmod`/`Client::chmod`；SFTP: `SftpSession::set_metadata`/`chmod_attrs`；UI: `chmod_dialog` | ✅ |
 
 ## 关键设计点
 
@@ -51,8 +51,13 @@
 - service：`session.rs` 解码后调 `storage::chmod`（mode=0 拒绝）。
 - client：右键菜单「Permissions」打开 `chmod_dialog`，八进制 0–0o7777 校验（`parse_octal_mode`）
   后 `Client::chmod` → `do_simple(Chmod, ...)`。
-- **仅 rdep 支持**：高版 `russh_sftp::client::SftpSession` 无 `setstat`（低版 RawSftpSession 有但未暴露），
-  与 publish/rollback 门控一致；ftp/sftp 点击时日志明确提示「chmod requires the rdep protocol...」。
+- **rdep + SFTP 均支持**：
+  - rdep：走自定义协议（service 端 `storage::chmod`）。
+  - SFTP：经 SFTP `setstat`——高版 `SftpSession` 虽未直接暴露 `setstat`，但提供了等价的
+    `set_metadata(path, FileAttributes{permissions:Some(mode),..})`（底层即 `SSH_FXP_SETSTAT`）。
+    `chmod_attrs(mode)` 只设 `permissions`、其余字段留空，避免 `setstat` 误清空 size/mtime。
+  - **FTP 仍不支持**（协议本身无标准 chmod，且本客户端未实现 `SITE CHMOD`）；点击时日志明确提示
+    「chmod not supported over FTP...」。
 
 ## 测试
 
@@ -68,5 +73,5 @@
 - `cargo clippy --all-targets`：本阶段改动源文件 **无 warning / error**（测试文件有少量预存风格 warning，非本次引入）。
 
 ## 已知限制 / 后续
-- chmod 仅 rdep 协议（SFTP 受限于 `SftpSession` API），如需 ftp/sftp 需改用底层 session。
+- chmod 已支持 **rdep + SFTP**；FTP 仍不支持（未实现 `SITE CHMOD`），点击时给出明确提示。
 - 站点「浏览」按钮因 client 无 `rfd` 依赖，仅回填当前本地目录而非弹出系统文件框。

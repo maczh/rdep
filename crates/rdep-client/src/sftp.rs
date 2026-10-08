@@ -48,7 +48,7 @@ use russh::client::{self, Handle};
 use russh::keys::PublicKeyOrCertificate;
 use russh::keys::HashAlg;
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::OpenFlags;
+use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc as async_mpsc;
 use tokio::sync::watch;
@@ -142,6 +142,12 @@ pub enum SftpCommand {
     EditSave {
         remote_path: String,
         content: String,
+    },
+    /// 远端 `chmod`：在 `path` 上设置权限位 `mode`（unix `st_mode & 0o777`）。
+    /// 经 SFTP `setstat`（高版 `SftpSession::set_metadata`，底层 `SSH_FXP_SETSTAT`）。
+    Chmod {
+        path: String,
+        mode: u32,
     },
 }
 
@@ -280,6 +286,10 @@ impl SftpClient {
                             Some(s) => do_edit_save(s, &remote_path, &content, &evt_tx).await,
                             None => send(&evt_tx, Event::Error(t("not connected (SFTP)").to_string())),
                         },
+                        SftpCommand::Chmod { path, mode } => match sess.as_mut() {
+                            Some(s) => do_chmod(s, &path, mode, &evt_tx).await,
+                            None => send(&evt_tx, Event::Error(t("not connected (SFTP)").to_string())),
+                        },
                     }
                 }
             });
@@ -354,6 +364,11 @@ impl SftpClient {
         let _ = self
             .cmd_tx
             .blocking_send(SftpCommand::EditSave { remote_path, content });
+    }
+    /// 远端 `chmod`：在 `path` 上设置权限位 `mode`（unix `st_mode & 0o777`）。
+    pub fn chmod(&self, path: String, mode: u32) {
+        tracing::debug!(path = %path, mode = format!("{mode:o}"), "sftp api: chmod");
+        let _ = self.cmd_tx.blocking_send(SftpCommand::Chmod { path, mode });
     }
 
     /// 非阻塞取一个事件（GUI 每帧调用）。
@@ -1193,6 +1208,36 @@ async fn do_edit_save(s: &mut Sess, remote_path: &str, content: &str, evt: &std_
     }
 }
 
+/// 构造 chmod 用的 `FileAttributes`：只设 `permissions`，其余字段留空（SFTP `setstat`
+/// 仅应用显式给出的属性，不会因空字段而清零 size/mtime 等）。
+fn chmod_attrs(mode: u32) -> FileAttributes {
+    FileAttributes {
+        permissions: Some(mode & 0o7777),
+        ..Default::default()
+    }
+}
+
+/// 远端 `chmod`：通过 SFTP `setstat`（`SSH_FXP_SETSTAT`，高版 `SftpSession::set_metadata`）
+/// 在 `path` 上设置权限位 `mode`。
+async fn do_chmod(s: &mut Sess, path: &str, mode: u32, evt: &std_mpsc::Sender<Event>) {
+    match s.sftp.set_metadata(path, chmod_attrs(mode)).await {
+        Ok(()) => send(
+            evt,
+            Event::OpDone {
+                ok: true,
+                message: t("chmod done").to_string(),
+            },
+        ),
+        Err(e) => send(
+            evt,
+            Event::OpDone {
+                ok: false,
+                message: format!("{}: {e}", t("chmod failed")),
+            },
+        ),
+    }
+}
+
 // ===========================================================================
 // 目录同步
 // ===========================================================================
@@ -1546,5 +1591,17 @@ mod tests {
         assert_eq!(p.host, "127.0.0.1");
         assert_eq!(p.port, 22);
         assert_eq!(p.pass, "pw");
+    }
+
+    /// chmod 属性构造：只设 permissions，其余字段留空（setstat 不会清零 size/mtime）。
+    #[test]
+    fn chmod_attrs_only_permissions() {
+        let a = chmod_attrs(0o755);
+        assert_eq!(a.permissions, Some(0o755));
+        assert!(a.size.is_none(), "size 必须为 None，否则会覆盖远端文件大小");
+        assert!(a.mtime.is_none(), "mtime 必须为 None，否则会篡改远端文件时间");
+        // setuid / setgid 等高比特权限也应透传
+        let a2 = chmod_attrs(0o4755);
+        assert_eq!(a2.permissions, Some(0o4755));
     }
 }

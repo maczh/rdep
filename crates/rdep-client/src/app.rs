@@ -497,16 +497,16 @@ impl RdepApp {
         }
     }
 
-    /// 远端 chmod（右键「权限」）。rdep 协议支持；SFTP/FTP 当前客户端构建未接 setstat，提示改用 rdep 站点。
+    /// 远端 chmod（右键「权限」）。rdep 与 SFTP 协议支持（SFTP 走 `setstat`）；FTP 协议不支持，提示改用 rdep/SFTP 站点。
     fn do_chmod(&mut self, path: String, mode: u32) {
         tracing::debug!(backend = ?self.backend, path = %path, mode = format!("{mode:o}"), "action: chmod");
-        if self.backend == Protocol::Rdep {
-            self.client.chmod(path, mode);
-        } else {
-            self.push_log(&tf(
-                "chmod requires the rdep protocol; current site is {p}, skipped",
+        match self.backend {
+            Protocol::Rdep => self.client.chmod(path, mode),
+            Protocol::Sftp => self.sftp.chmod(path, mode),
+            Protocol::Ftp => self.push_log(&tf(
+                "chmod not supported over FTP; current site is {p}, skipped",
                 &[("p", protocol_name(self.backend))],
-            ));
+            )),
         }
     }
 
@@ -3161,9 +3161,9 @@ mod gui_smoke {
         render(&mut app, 3);
     }
 
-    /// chmod 按钮：rdep 走 client.chmod（不 panic）；非 rdep 协议应给出明确拦截日志。
+    /// chmod 按钮：rdep 与 SFTP 走各自 client.chmod（不拦截、不 panic）；FTP 协议不支持，给出明确拦截日志。
     #[test]
-    fn chmod_gating_rdep_vs_ftp() {
+    fn chmod_dispatch_rdep_sftp_vs_ftp() {
         let mut app = test_app("chmodgate");
 
         app.backend = Protocol::Rdep;
@@ -3171,12 +3171,17 @@ mod gui_smoke {
         app.do_chmod("/opt/app/x".into(), 0o644);
         assert_eq!(app.log.len(), before, "rdep 不应拦截 chmod（无额外日志）");
 
+        app.backend = Protocol::Sftp;
+        let before = app.log.len();
+        app.do_chmod("/opt/app/x".into(), 0o644);
+        assert_eq!(app.log.len(), before, "sftp 不应拦截 chmod（无额外日志）");
+
         app.backend = Protocol::Ftp;
         app.do_chmod("/opt/app/x".into(), 0o644);
         let last = app.log.last().cloned().unwrap_or_default();
         assert!(
-            last.contains("rdep protocol"),
-            "非 rdep 应提示需 rdep 协议: {last}"
+            last.contains("FTP"),
+            "FTP 应提示不支持 chmod: {last}"
         );
     }
 

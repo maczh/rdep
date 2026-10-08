@@ -170,7 +170,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("Apply", "应用", "套用"),
     ("chmod done", "权限已修改", "權限已修改"),
     ("chmod failed", "权限修改失败", "權限修改失敗"),
-    ("chmod requires the rdep protocol; current site is {p}, skipped", "「权限」需要 rdep 协议，当前站点是 {p}，已跳过", "「權限」需要 rdep 協定，目前站台是 {p}，已跳過"),
+    ("chmod not supported over FTP; current site is {p}, skipped", "「权限」不支持 FTP 协议，当前站点是 {p}，已跳过", "「權限」不支援 FTP 協定，目前站台是 {p}，已跳過"),
     ("invalid octal mode", "八进制权限格式不合法（应为 0-7 数字，如 0644）", "八進位權限格式不合法（應為 0-7 數字，如 0644）"),
     ("Remote path is required", "请填写远端路径", "請填寫遠端路徑"),
     ("Directory sync", "目录同步", "目錄同步"),
