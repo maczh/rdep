@@ -964,6 +964,9 @@ impl RdepApp {
                 self.tail_view.push('\n');
                 if self.tail_view.len() > 200_000 {
                     let drop = self.tail_view.len() - 200_000;
+                    let drop = (drop..=self.tail_view.len())
+                        .find(|&index| self.tail_view.is_char_boundary(index))
+                        .unwrap_or(self.tail_view.len());
                     self.tail_view.drain(..drop);
                 }
                 // 标记内容已更新，tail 弹窗据此自动滚到底部
@@ -3028,6 +3031,17 @@ mod gui_smoke {
         app.handle(Event::TailLine { line: "line-2".into() });
         assert_eq!(app.tail_output.len(), 2);
         assert_eq!(app.tail_view, "line-1\nline-2\n", "结果编辑窗缓冲应逐行追加");
+    }
+
+    /// tail 缓冲按字节限长时，截断位置必须仍是 UTF-8 字符边界。
+    #[test]
+    fn tail_buffer_truncation_preserves_utf8() {
+        let mut app = test_app("tailutf8");
+        let line = "界".repeat(66_667);
+        app.handle(Event::TailLine { line });
+
+        assert!(app.tail_view.len() <= 200_000);
+        assert_eq!(app.tail_view, format!("{}\n", "界".repeat(66_666)));
     }
 
     /// 远端路径拼接工具函数。
