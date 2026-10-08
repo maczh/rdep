@@ -10,8 +10,9 @@
 - service / forwarder Web = axum；DB = rusqlite / sqlx-sqlite。
 
 ## 实施路线
-- Phase 0（协议地基，**已完成**）→ 1(service 核心文件能力) → 2(client UI) → 3(发布/回滚全链路) → 4(tail/grep/edit) → 5(forwarder 中转) → 6(Web 管理) → 7(部署产物) → **8(client 体验增强，已完成：FileZilla 风格站点管理 / tail 自动滚+关窗停跟随 / grep 标红 / 编辑先备份后覆盖 / 上传下载保留 mode+mtime / 右键权限远程 chmod(rdep only))**。
+- Phase 0（协议地基，**已完成**）→ 1(service 核心文件能力) → 2(client UI) → 3(发布/回滚全链路) → 4(tail/grep/edit) → 5(forwarder 中转) → 6(Web 管理) → 7(部署产物) → **8(client 体验增强，已完成：FileZilla 风格站点管理 / tail 自动滚+关窗停跟随 / grep 标红 / 编辑先备份后覆盖 / 上传下载保留 mode+mtime / 右键权限远程 chmod(rdep+SFTP) / 站点「浏览…」接 rfd 系统文件框(xdg-portal))**。
 - chmod 支持 **rdep + SFTP**：rdep 走自定义协议（`storage::chmod`）；SFTP 走 `SftpSession::set_metadata`（底层 `SSH_FXP_SETSTAT`/`setstat`，属性只设 `permissions` 避免清空 size/mtime）。**FTP 仍不支持**（无标准 chmod，未实现 `SITE CHMOD`）。
+- **站点「浏览…」按钮接 rfd**（Phase 8 #7，已完成）：rfd 作 `gui` 特性可选依赖，`default-features=false, features=["xdg-portal","tokio"]`（本机无 GTK 头文件，禁用 gtk3/4 后端）；同步 `pick_folder` 内部 `pollster::block_on` 驱动 portal，放独立线程 + `std::sync::mpsc` 通道回传，下一帧 `drain_events` 写回 `site_default_local`。无显示/无 portal 环境 `pick_folder` 返回 `None`、UI 保持原值。
 
 ## 约定
 - 三端共用 `crates/rdep-protocol`，该 crate **不依赖异步运行时**，纯类型 + 编解码，便于单测与复用。

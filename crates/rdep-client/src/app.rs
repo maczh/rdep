@@ -130,6 +130,12 @@ pub struct RdepApp {
     /// 从站点载入的远端目录：连接成功后落到这里（消费后清空）。
     pending_remote_dir: Option<String>,
 
+    /// 本地目录浏览对话框的结果通道。点击「浏览…」时在独立线程打开系统文件选择框
+    /// （rfd，Linux 走 xdg-portal），用户选完或取消后结果经此通道回传，
+    /// 下一帧 `drain_events` 读取并写入 `site_default_local`。
+    /// `Some(rx)` = 对话框等待中（避免重复打开）；`None` = 当前无对话框等待。
+    browse_rx: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
+
     // 远端新建目录
     new_dir: String,
     // 远端改名输入
@@ -302,6 +308,7 @@ impl RdepApp {
             sync_remote: "/opt/app".into(),
             sync_delete_extra: false,
             sync_preview: None,
+            browse_rx: None,
         };
         app.refresh_local();
         app.push_log(t("rdep client started"));
@@ -793,6 +800,28 @@ impl RdepApp {
         }
         while let Some(ev) = self.sftp.next_event() {
             self.handle(ev);
+        }
+
+        // 本地目录浏览对话框的结果（独立线程回传，不阻塞渲染）。
+        // 先取出 owned 的接收结果，再改 self，避免借用冲突。
+        let picked = self.browse_rx.as_ref().map(|rx| rx.try_recv());
+        match picked {
+            Some(Ok(Some(path))) => {
+                self.site_default_local = path.to_string_lossy().into_owned();
+                self.browse_rx = None;
+            }
+            Some(Ok(None)) => {
+                // 用户取消：保持原值，清理等待状态
+                self.browse_rx = None;
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                // 对话框仍未回传，下一帧继续等待
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                // 后台线程异常退出且无结果，丢弃等待状态
+                self.browse_rx = None;
+            }
+            None => {}
         }
     }
 
@@ -2249,13 +2278,13 @@ impl RdepApp {
         labeled(ui, t("Comment"), &mut self.site_comment);
     }
 
-    /// 高级标签页：默认本地目录（浏览=填入当前本地目录）/ 默认远端目录。
+    /// 高级标签页：默认本地目录（浏览=系统文件选择框）/ 默认远端目录。
     fn site_tab_advanced(&mut self, ui: &mut egui::Ui) {
         ui.label(t("Default local directory"));
         ui.horizontal(|ui| {
             ui.text_edit_singleline(&mut self.site_default_local);
             if ui.button(t("Browse...")).clicked() {
-                self.site_default_local = self.local_dir.to_string_lossy().into_owned();
+                self.open_local_dir_picker();
             }
         });
         ui.horizontal(|ui| {
@@ -2266,6 +2295,36 @@ impl RdepApp {
         ui.separator();
         labeled(ui, t("Default remote directory"), &mut self.site_default_remote);
         ui.label(t("Connection opens directly into these directories"));
+    }
+
+    /// 打开系统文件选择框挑选「默认本地目录」（rfd；Linux 经 xdg-portal 调起原生对话框）。
+    ///
+    /// rfd 的同步 `FileDialog::pick_folder()` 内部用 `pollster::block_on` 驱动异步的 portal 通路，
+    /// 必须在独立线程上调用以免卡住 egui 渲染。结果经 `browse_rx` 通道回传，
+    /// 下一帧 `drain_events` 读取并写入 `site_default_local`。
+    ///
+    /// 已有一个对话框在等待结果时（`browse_rx.is_some()`）不重复打开。
+    fn open_local_dir_picker(&mut self) {
+        if self.browse_rx.is_some() {
+            return;
+        }
+        // 初始目录：优先用已填写的默认值，否则用当前本地面板目录
+        let initial = if self.site_default_local.trim().is_empty() {
+            self.local_dir.clone()
+        } else {
+            PathBuf::from(self.site_default_local.trim())
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<Option<PathBuf>>();
+        self.browse_rx = Some(rx);
+        std::thread::spawn(move || {
+            // 独立线程：不阻塞 egui 主线程。无显示环境（CI/无 portal）下
+            // pick_folder 会返回 None，结果通道照常回传，UI 保持原值。
+            let picked = rfd::FileDialog::new()
+                .set_title(t("Select default local directory"))
+                .set_directory(&initial)
+                .pick_folder();
+            let _ = tx.send(picked);
+        });
     }
 
     /// 传输设置标签页：并发传输数。
@@ -3183,6 +3242,30 @@ mod gui_smoke {
             last.contains("FTP"),
             "FTP 应提示不支持 chmod: {last}"
         );
+    }
+
+    /// 浏览对话框结果经 `browse_rx` 通道回传后，应写入 `site_default_local`。
+    /// 不调用真实 rfd 对话框（无显示/无 portal 环境无法交互），直接注入通道结果验证接线逻辑。
+    #[test]
+    fn browse_picker_wires_result_into_site_default_local() {
+        let mut app = test_app("browse");
+
+        // 场景 1：用户选了一个目录 -> 写入 site_default_local，并清空等待状态
+        let (tx, rx) = std::sync::mpsc::channel::<Option<PathBuf>>();
+        tx.send(Some(PathBuf::from("/srv/www"))).unwrap();
+        app.browse_rx = Some(rx);
+        app.drain_events();
+        assert_eq!(app.site_default_local, "/srv/www");
+        assert!(app.browse_rx.is_none(), "结果处理后应清空等待状态");
+
+        // 场景 2：用户取消（None）-> 保持原值，并清空等待状态
+        let (tx, rx) = std::sync::mpsc::channel::<Option<PathBuf>>();
+        app.site_default_local = "keep-me".into();
+        tx.send(None).unwrap();
+        app.browse_rx = Some(rx);
+        app.drain_events();
+        assert_eq!(app.site_default_local, "keep-me");
+        assert!(app.browse_rx.is_none(), "取消后也应清空等待状态");
     }
 
     /// 八进制权限解析：合法串 -> Some；非法串 -> None；范围越界 -> None。

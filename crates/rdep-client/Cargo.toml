@@ -15,7 +15,7 @@ required-features = ["gui"]
 
 [features]
 default = ["gui"]
-gui = ["dep:egui", "dep:eframe"]
+gui = ["dep:egui", "dep:eframe", "dep:rfd"]
 
 [dependencies]
 rdep-protocol = { path = "../rdep-protocol" }
@@ -52,6 +52,11 @@ chrono = "0.4"
 
 egui = { version = "0.29", optional = true }
 eframe = { version = "0.29", optional = true }
+# 系统文件选择框（站点管理器「浏览…」按钮）。仅 gui 特性启用；
+# Linux 用纯 Rust 的 xdg-portal 后端（ashpd），避免依赖 gtk3/4 系统开发包
+# （本机构建环境无 gtk 头文件，gtk3/gtk4 后端无法编译）。
+# xdg-portal 后端需要异步运行时驱动，启用项目既有的 tokio 特性。
+rfd = { version = "0.14", optional = true, default-features = false, features = ["xdg-portal", "tokio"] }
 
 [dev-dependencies]
 rdep-service = { path = "../rdep-service" }

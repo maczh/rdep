@@ -237,6 +237,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("Concurrent transfers", "并发传输数", "並發傳輸數"),
     ("Use current local directory", "使用当前本地目录", "使用目前本機目錄"),
     ("Browse...", "浏览…", "瀏覽…"),
+    ("Select default local directory", "选择默认本地目录", "選擇預設本機目錄"),
     ("Auto", "自动", "自動"),
     ("Force UTF-8", "强制 UTF-8", "強制 UTF-8"),
     ("OK", "确定", "確定"),
