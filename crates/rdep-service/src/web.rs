@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::Html;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -402,8 +403,8 @@ async fn rollback(
     Ok(Json(OkResp { ok: true }))
 }
 
-async fn index() -> &'static str {
-    INDEX_HTML
+async fn index() -> Html<&'static str> {
+    Html(INDEX_HTML)
 }
 
 /// 组装路由。
