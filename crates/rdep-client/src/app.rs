@@ -1911,13 +1911,14 @@ impl RdepApp {
                 // 编辑框设为只读，避免其内部滚动吞掉滚轮、导致无法整体滚动。
                 let autoscroll = self.tail_follow || self.tail_view_dirty;
                 egui::ScrollArea::vertical()
-                    .max_height(320.0)
+                    .max_height(720.0)
                     .show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut self.tail_view)
                                 .desired_width(f32::INFINITY)
                                 .font(egui::TextStyle::Monospace)
-                                .interactive(false),
+                                .clip_text(true)
+                                .interactive(true),
                         );
                         if autoscroll {
                             ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
@@ -1941,7 +1942,7 @@ impl RdepApp {
             .open(&mut open)
             .collapsible(false)
             .default_width(680.0)
-            .default_height(460.0)
+            .default_height(660.0)
             .show(ctx, |ui| {
                 labeled(ui, t("Path"), &mut self.grep_path);
                 labeled(ui, t("Pattern"), &mut self.grep_pattern);
@@ -1963,7 +1964,7 @@ impl RdepApp {
                 let pattern = self.grep_pattern.clone();
                 let ignore_case = self.grep_flags.contains('i');
                 egui::ScrollArea::vertical()
-                    .max_height(300.0)
+                    .max_height(720.0)
                     .show(ui, |ui| {
                         if self.grep_output.is_empty() {
                             ui.label(t("(no output)"));
@@ -2066,12 +2067,15 @@ impl RdepApp {
     fn sites_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_sites;
         let mut close = false;
-        let backend_before = self.backend;
         egui::Window::new(t("Site manager"))
+            .id(egui::Id::new("site_manager_v2"))
             .open(&mut open)
             .collapsible(false)
-            .default_width(780.0)
-            .default_height(540.0)
+            .resizable(true)
+            // .auto_sized()
+            .default_height(760.0)
+            // .default_size(egui::vec2(780.0, 760.0))
+            // .min_size(egui::vec2(620.0, 720.0))
             .show(ctx, |ui| {
                 ui.label(format!("{} {}", t("Config file:"), self.store.path().display()));
                 ui.separator();
@@ -2087,10 +2091,12 @@ impl RdepApp {
                         }
                         ui.separator();
                         egui::ScrollArea::vertical()
-                            .max_height(380.0)
+                            .id_salt("site_left_scroll")
+                            .auto_shrink([false; 2])
                             .show(ui, |ui| {
                                 let mut clicked: Option<usize> = None;
                                 egui::CollapsingHeader::new(t("My Sites"))
+                                    .id_salt("site_tree_header")
                                     .default_open(true)
                                     .show(ui, |ui| {
                                         for (i, s) in self.sites.iter().enumerate() {
@@ -2160,7 +2166,8 @@ impl RdepApp {
                         ui.separator();
 
                         egui::ScrollArea::vertical()
-                            .max_height(330.0)
+                            .id_salt("site_right_scroll")
+                            .auto_shrink([false; 2])
                             .show(ui, |ui| match self.site_tab {
                                 0 => self.site_tab_general(ui),
                                 1 => self.site_tab_advanced(ui),
@@ -2188,15 +2195,12 @@ impl RdepApp {
                 });
             });
 
-        // 切换协议时同步端口到该协议默认值（避免残留上一协议端口）
-        if self.backend != backend_before {
-            sync_port_to_protocol(self);
-        }
         self.show_sites = open && !close;
     }
 
     /// 常规标签页：协议 / 主机 / 端口 / 登录类型 / 用户·密码 / CA / 中转 / 标签颜色 / 注释。
     fn site_tab_general(&mut self, ui: &mut egui::Ui) {
+        let proto_before = self.backend;
         ui.horizontal(|ui| {
             ui.label(t("Protocol"));
             egui::ComboBox::from_id_salt("site_proto")
@@ -2207,6 +2211,9 @@ impl RdepApp {
                     }
                 });
         });
+        if self.backend != proto_before {
+            sync_port_to_protocol(self);
+        }
         if !self.backend.supports_advanced() {
             ui.colored_label(
                 egui::Color32::from_gray(140),
@@ -3205,6 +3212,31 @@ mod gui_smoke {
         sync_port_to_protocol(&mut app);
         assert_eq!(app.cfg_port, "8443", "切到 rdep 应回填端口 8443");
         render(&mut app, 2);
+    }
+
+    /// 选中 SFTP 站点后，站点管理器渲染不应把自定义端口覆盖回协议默认值。
+    #[test]
+    fn sites_window_preserves_sftp_custom_port() {
+        let mut app = test_app("sftpport");
+        app.sites = vec![Site {
+            name: "sftp-custom".into(),
+            protocol: Protocol::Sftp,
+            host: "118.31.124.97".into(),
+            port: 42637,
+            user: "ops".into(),
+            ..Default::default()
+        }];
+        app.site_selected = Some(0);
+        app.load_site_into_form(0);
+        assert_eq!(app.cfg_port, "42637", "载入站点时应保留自定义端口");
+        assert_eq!(app.backend, Protocol::Sftp, "载入站点时应设置 SFTP 协议");
+
+        app.show_sites = true;
+        render(&mut app, 3);
+        assert_eq!(
+            app.cfg_port, "42637",
+            "渲染站点管理器后不应覆盖自定义 SFTP 端口"
+        );
     }
 
     /// tail：收到新日志行应置 dirty 触发自动滚动；渲染 tail 弹窗后 dirty 被清零。
