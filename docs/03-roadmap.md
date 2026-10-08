@@ -96,7 +96,12 @@ Phase0 ─► Phase1 ─► Phase2 ─► Phase3 ─► Phase4
    - SFTP：经 `SftpSession::set_metadata`（`SSH_FXP_SETSTAT`，底层 `setstat`）实现，属性只设 `permissions` 不误清空 size/mtime。
    - FTP 协议无标准 chmod，仍不支持；点击时日志提示「chmod not supported over FTP...」。
 
-- **验证**：`cargo test -p rdep-protocol -p rdep-service -p rdep-client`（lib 76 + integration 18 全绿）；
+7. **站点「浏览…」按钮接入 rfd 系统文件框**
+   - 站点管理器 → Advanced → 「默认本地目录」旁「浏览…」按钮，经 `rfd` 调起系统原生文件选择框（Linux 走 xdg-portal / ashpd，纯 Rust，无需 GTK 开发包）。
+   - 对话框在独立线程打开（`open_local_dir_picker`，同步 API 内部 `pollster::block_on` 驱动异步 portal），结果经 `browse_rx` 通道回传，下一帧 `drain_events` 写回 `site_default_local`，不阻塞 egui 渲染。
+   - rfd 作为 `gui` feature 的可选依赖（`default-features=false, features=["xdg-portal","tokio"]`）；本机无 GTK 头文件，故禁用 gtk3/4 后端。
+
+- **验证**：`cargo test -p rdep-protocol -p rdep-service -p rdep-client`（lib 78 + integration 18 全绿）；
   `cargo clippy --all-targets` 无 error。新增/增强单测覆盖：站点字段往返、grep 标红渲染、tail 脏标记、
-  chmod rdep/ftp 门控、八进制解析、备份改名覆盖、mtime/mode 保留。
+  chmod rdep/ftp 门控、八进制解析、备份改名覆盖、mtime/mode 保留、浏览框通道回写。
 - **详细**：见 `docs/phase8-overview.md`。

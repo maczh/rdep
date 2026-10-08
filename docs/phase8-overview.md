@@ -13,13 +13,14 @@
 | 4 | 编辑保存先备份原文件再覆盖原文件名 | `rdep-service/src/storage.rs` `save_with_backup` | ✅ |
 | 5 | 上传/下载保留 mode + mtime | service `set_mtime`/`apply_mode`；`DownloadResponse{mode,mtime,sha256}`；client `apply_local_*` | ✅ |
 | 6 | 右键「权限」→ 远程 chmod（rdep + SFTP） | rdep: `CmdType::Chmod`/`storage::chmod`/`Client::chmod`；SFTP: `SftpSession::set_metadata`/`chmod_attrs`；UI: `chmod_dialog` | ✅ |
+| 7 | 站点「浏览…」按钮接入 rfd 系统文件框（xdg-portal，纯 Rust 无 GTK 依赖） | `open_local_dir_picker`（独立线程）+ `browse_rx` 通道 + `drain_events` 轮询回写 `site_default_local` | ✅ |
 
 ## 关键设计点
 
 ### 站点管理器（需求 1）
 - 左栏「My Sites」可折叠树（`CollapsingHeader::default_open(true)`）+ 新建/删除；右栏四页签：
   - **General**：协议（sftp/ftp/rdep）、登录类型（Normal/Key file/Ask）、用户名/密码（Ask 时不显示）、CA 证书、rdep 中转块、背景色（含 `#RRGGBB` 预览色块）、备注。
-  - **Advanced**：默认本地目录（有「浏览…/用当前本地目录」按钮，无 rfd 时回填当前 `local_dir`）、默认远程目录。
+  - **Advanced**：默认本地目录（「浏览…」经 rfd 调起系统文件选择框，选完回填路径；「用当前本地目录」回填当前 `local_dir`）、默认远程目录。
   - **Transfer Settings**：并发数 `DragValue` 1–16。
   - **Charset**：Auto / Force UTF-8。
 - 切协议自动同步默认端口：`default_port_for_protocol` / `sync_port_to_protocol`（22/21/8443）。
@@ -62,16 +63,18 @@
 ## 测试
 
 - `cargo test -p rdep-protocol -p rdep-service -p rdep-client`
-  - lib：rdep-client 49 + rdep-protocol 5 + rdep-service 22 = **76 passed**
+  - lib：rdep-client 51 + rdep-protocol 5 + rdep-service 22 = **78 passed**
   - integration：**18 passed**（含 `tail_grep_edit_e2e`、`mode_preservation_e2e`、`site_saved_drives_connection_e2e`）
 - 新增/增强单测：
   - `app::gui_smoke`：`site_manager_persists_new_fields`、`sites_window_renders_all_protocols_and_tabs`、
     `tail_dirty_flag_set_by_new_line_and_reset_after_render`、`grep_highlight_renders_with_pattern`、
-    `chmod_gating_rdep_vs_ftp`、`parse_octal_mode_cases`、`remote_context_menu_opens_permissions`。
+    `chmod_gating_rdep_vs_ftp`、`parse_octal_mode_cases`、`remote_context_menu_opens_permissions`、
+    `browse_picker_wires_result_into_site_default_local`（注入 `browse_rx` 通道结果，验证回写 `site_default_local`，不调用真实对话框）。
   - `storage::preservation_tests`：`mtime_and_mode_preserved_through_meta`、`chmod_changes_mode`、
     `edit_save_backs_up_then_overwrites`（用 `with_meta` 构造以贴合生产 `meta` 分离布局）。
 - `cargo clippy --all-targets`：本阶段改动源文件 **无 warning / error**（测试文件有少量预存风格 warning，非本次引入）。
 
 ## 已知限制 / 后续
 - chmod 已支持 **rdep + SFTP**；FTP 仍不支持（未实现 `SITE CHMOD`），点击时给出明确提示。
-- 站点「浏览」按钮因 client 无 `rfd` 依赖，仅回填当前本地目录而非弹出系统文件框。
+- 站点「浏览…」按钮已接入 **rfd**（Linux 走纯 Rust 的 xdg-portal / ashpd 后端，无需 GTK 系统开发包）。
+  无显示/无 portal 环境（CI、headless）下 `pick_folder` 会返回 `None`，UI 保持原值、不报错。
